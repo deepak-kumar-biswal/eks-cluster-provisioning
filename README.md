@@ -1,10 +1,23 @@
-# 🚀 Enterprise EKS Cluster Automation Platform
+<div align="center">
+  <img src="https://img.shields.io/badge/🚀-EKS%20Cluster%20Platform-blue?style=for-the-badge&logoColor=white" alt="EKS Platform"/>
+  <img src="https://img.shields.io/badge/⚡-Enterprise%20Grade-orange?style=for-the-badge" alt="Enterprise"/>
+  <img src="https://img.shields.io/badge/🏆-Award%20Winning-gold?style=for-the-badge" alt="Award Winning"/>
+</div>
+
+<div align="center">
+  <h1>🚀 Enterprise EKS Cluster Automation Platform</h1>
+  <p><strong>Award-winning enterprise-grade EKS cluster automation for hyperscale organizations</strong></p>
+</div>
+
+<div align="center">
 
 [![EKS CI/CD](https://github.com/your-org/eks-cluster-provisioning/workflows/EKS%20CI/CD/badge.svg)](https://github.com/your-org/eks-cluster-provisioning/actions)
 [![Security Scan](https://github.com/your-org/eks-cluster-provisioning/workflows/Security%20Scan/badge.svg)](https://github.com/your-org/eks-cluster-provisioning/actions)
 [![Chaos Engineering](https://github.com/your-org/eks-cluster-provisioning/workflows/Chaos%20Engineering/badge.svg)](https://github.com/your-org/eks-cluster-provisioning/actions)
 [![EKS Upgrades](https://github.com/your-org/eks-cluster-provisioning/workflows/EKS%20Upgrades/badge.svg)](https://github.com/your-org/eks-cluster-provisioning/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+</div>
 
 ## 🏆 Award-Winning EKS Cluster Management at Scale
 

@@ -1,0 +1,448 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-bootstrap-applicationset
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: cluster-bootstrap
+    app.kubernetes.io/component: applicationset
+spec:
+  generators:
+  - clusters:
+      selector:
+        matchLabels:
+          environment: dev
+  - clusters:
+      selector:
+        matchLabels:
+          environment: staging
+  - clusters:
+      selector:
+        matchLabels:
+          environment: prod
+  template:
+    metadata:
+      name: '{{name}}-bootstrap'
+      labels:
+        app.kubernetes.io/name: cluster-bootstrap
+        app.kubernetes.io/instance: '{{name}}'
+        environment: '{{metadata.labels.environment}}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/your-org/eks-cluster-provisioning
+        targetRevision: HEAD
+        path: argocd/bootstrap/{{metadata.labels.environment}}
+      destination:
+        server: '{{server}}'
+        namespace: argocd
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: monitoring-applicationset
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: monitoring
+    app.kubernetes.io/component: applicationset
+spec:
+  generators:
+  - clusters:
+      selector:
+        matchLabels:
+          monitoring: enabled
+      values:
+        prometheus_retention: '{{metadata.labels.prometheus_retention}}'
+        grafana_replicas: '{{metadata.labels.grafana_replicas}}'
+        storage_class: '{{metadata.labels.storage_class}}'
+  template:
+    metadata:
+      name: '{{name}}-monitoring'
+      labels:
+        app.kubernetes.io/name: monitoring-stack
+        app.kubernetes.io/instance: '{{name}}'
+        environment: '{{metadata.labels.environment}}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        repoURL: https://prometheus-community.github.io/helm-charts
+        chart: kube-prometheus-stack
+        targetRevision: 56.21.4
+        helm:
+          releaseName: prometheus-stack
+          values: |
+            # Environment-specific configuration
+            global:
+              resolve_timeout: 5m
+            
+            prometheus:
+              enabled: true
+              prometheusSpec:
+                retention: {{values.prometheus_retention}}
+                retentionSize: 50GiB
+                replicas: {{#if (eq metadata.labels.environment "prod")}}3{{else}}2{{/if}}
+                
+                resources:
+                  requests:
+                    cpu: {{#if (eq metadata.labels.environment "prod")}}500m{{else}}200m{{/if}}
+                    memory: {{#if (eq metadata.labels.environment "prod")}}1Gi{{else}}400Mi{{/if}}
+                  limits:
+                    cpu: {{#if (eq metadata.labels.environment "prod")}}2000m{{else}}1000m{{/if}}
+                    memory: {{#if (eq metadata.labels.environment "prod")}}4Gi{{else}}2Gi{{/if}}
+                
+                storageSpec:
+                  volumeClaimTemplate:
+                    spec:
+                      storageClassName: {{values.storage_class}}
+                      accessModes: ["ReadWriteOnce"]
+                      resources:
+                        requests:
+                          storage: {{#if (eq metadata.labels.environment "prod")}}100Gi{{else}}50Gi{{/if}}
+                
+                nodeSelector:
+                  NodeType: system
+                
+                tolerations:
+                  - key: "CriticalAddonsOnly"
+                    operator: "Equal"
+                    value: "true"
+                    effect: "NoSchedule"
+                
+                externalLabels:
+                  cluster: '{{name}}'
+                  environment: '{{metadata.labels.environment}}'
+                  region: '{{metadata.labels.region}}'
+            
+            grafana:
+              enabled: true
+              adminPassword: "{{metadata.labels.grafana_password}}"
+              
+              replicas: {{values.grafana_replicas}}
+              
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: {{#if (eq metadata.labels.environment "prod")}}500m{{else}}200m{{/if}}
+                  memory: {{#if (eq metadata.labels.environment "prod")}}512Mi{{else}}256Mi{{/if}}
+              
+              persistence:
+                enabled: true
+                storageClassName: {{values.storage_class}}
+                size: {{#if (eq metadata.labels.environment "prod")}}20Gi{{else}}10Gi{{/if}}
+              
+              service:
+                type: LoadBalancer
+                annotations:
+                  service.beta.kubernetes.io/aws-load-balancer-type: nlb
+                  service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+              
+              nodeSelector:
+                NodeType: system
+              
+              tolerations:
+                - key: "CriticalAddonsOnly"
+                  operator: "Equal"
+                  value: "true"
+                  effect: "NoSchedule"
+              
+              defaultDashboardsEnabled: true
+              defaultDashboardsTimezone: UTC
+              
+              plugins:
+                - grafana-piechart-panel
+                - grafana-worldmap-panel
+                - grafana-clock-panel
+            
+            alertmanager:
+              enabled: true
+              alertmanagerSpec:
+                replicas: {{#if (eq metadata.labels.environment "prod")}}3{{else}}2{{/if}}
+                
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                  limits:
+                    cpu: {{#if (eq metadata.labels.environment "prod")}}300m{{else}}200m{{/if}}
+                    memory: {{#if (eq metadata.labels.environment "prod")}}512Mi{{else}}256Mi{{/if}}
+                
+                storage:
+                  volumeClaimTemplate:
+                    spec:
+                      storageClassName: {{values.storage_class}}
+                      accessModes: ["ReadWriteOnce"]
+                      resources:
+                        requests:
+                          storage: {{#if (eq metadata.labels.environment "prod")}}20Gi{{else}}10Gi{{/if}}
+                
+                nodeSelector:
+                  NodeType: system
+                
+                tolerations:
+                  - key: "CriticalAddonsOnly"
+                    operator: "Equal"
+                    value: "true"
+                    effect: "NoSchedule"
+      destination:
+        server: '{{server}}'
+        namespace: monitoring
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: security-applicationset
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: security
+    app.kubernetes.io/component: applicationset
+spec:
+  generators:
+  - clusters:
+      selector:
+        matchLabels:
+          security: enabled
+  template:
+    metadata:
+      name: '{{name}}-security'
+      labels:
+        app.kubernetes.io/name: security-stack
+        app.kubernetes.io/instance: '{{name}}'
+        environment: '{{metadata.labels.environment}}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/your-org/eks-cluster-provisioning
+        targetRevision: HEAD
+        path: security/manifests/{{metadata.labels.environment}}
+      destination:
+        server: '{{server}}'
+        namespace: security-system
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: application-workloads-applicationset
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: application-workloads
+    app.kubernetes.io/component: applicationset
+spec:
+  generators:
+  - git:
+      repoURL: https://github.com/your-org/application-manifests
+      revision: HEAD
+      directories:
+      - path: applications/*/environments/{{cluster.metadata.labels.environment}}
+      - path: applications/*/common
+  - clusters:
+      selector:
+        matchLabels:
+          applications: enabled
+      values:
+        environment: '{{metadata.labels.environment}}'
+        cluster_name: '{{name}}'
+  template:
+    metadata:
+      name: '{{path.basename}}-{{values.cluster_name}}'
+      labels:
+        app.kubernetes.io/name: '{{path.basename}}'
+        app.kubernetes.io/instance: '{{values.cluster_name}}'
+        environment: '{{values.environment}}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/your-org/application-manifests
+        targetRevision: HEAD
+        path: '{{path}}'
+      destination:
+        server: '{{server}}'
+        namespace: '{{path.basename}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PrunePropagationPolicy=foreground
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: backup-applicationset
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: backup
+    app.kubernetes.io/component: applicationset
+spec:
+  generators:
+  - clusters:
+      selector:
+        matchLabels:
+          backup: enabled
+  template:
+    metadata:
+      name: '{{name}}-backup'
+      labels:
+        app.kubernetes.io/name: backup-stack
+        app.kubernetes.io/instance: '{{name}}'
+        environment: '{{metadata.labels.environment}}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        repoURL: https://vmware-tanzu.github.io/helm-charts
+        chart: velero
+        targetRevision: 5.4.1
+        helm:
+          releaseName: velero
+          values: |
+            # Velero configuration for backup and disaster recovery
+            configuration:
+              provider: aws
+              backupStorageLocation:
+                name: default
+                bucket: {{metadata.labels.backup_bucket}}
+                config:
+                  region: {{metadata.labels.region}}
+                  s3ForcePathStyle: false
+                  s3Url: https://s3.{{metadata.labels.region}}.amazonaws.com
+              volumeSnapshotLocation:
+                name: default
+                config:
+                  region: {{metadata.labels.region}}
+            
+            # Service account configuration
+            serviceAccount:
+              server:
+                create: true
+                name: velero
+                annotations:
+                  eks.amazonaws.com/role-arn: {{metadata.labels.velero_role_arn}}
+            
+            # Resource configuration
+            resources:
+              requests:
+                cpu: 500m
+                memory: 128Mi
+              limits:
+                cpu: 1000m
+                memory: 512Mi
+            
+            # Node selection
+            nodeSelector:
+              NodeType: system
+            
+            tolerations:
+              - key: "CriticalAddonsOnly"
+                operator: "Equal"
+                value: "true"
+                effect: "NoSchedule"
+            
+            # Backup schedules
+            schedules:
+              daily:
+                disabled: false
+                schedule: "0 2 * * *"
+                template:
+                  ttl: "{{#if (eq metadata.labels.environment "prod")}}2160h{{else}}168h{{/if}}"
+                  includedNamespaces:
+                    - "*"
+                  excludedNamespaces:
+                    - kube-system
+                    - kube-public
+                    - kube-node-lease
+                    - argocd
+              weekly:
+                disabled: {{#if (eq metadata.labels.environment "prod")}}false{{else}}true{{/if}}
+                schedule: "0 1 * * 0"
+                template:
+                  ttl: "4320h"  # 180 days
+                  includedNamespaces:
+                    - "*"
+                  excludedNamespaces:
+                    - kube-system
+                    - kube-public
+                    - kube-node-lease
+                    - argocd
+            
+            # Deployment configuration
+            deployRestic: true
+            
+            # Metrics
+            metrics:
+              enabled: true
+              serviceMonitor:
+                enabled: true
+      destination:
+        server: '{{server}}'
+        namespace: velero
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

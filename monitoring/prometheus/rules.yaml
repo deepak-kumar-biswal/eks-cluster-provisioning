@@ -1,0 +1,358 @@
+groups:
+  - name: eks-cluster-health
+    interval: 30s
+    rules:
+      - alert: KubernetesNodeReady
+        expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+        for: 10m
+        labels:
+          severity: critical
+          category: infrastructure
+          component: node
+        annotations:
+          summary: "Kubernetes Node not ready"
+          description: "Node {{ $labels.node }} has been unready for more than 10 minutes."
+          runbook_url: "https://runbooks.prometheus-operator.dev/runbooks/kubernetes/kubernetesnodeready"
+          dashboard_url: "https://grafana.example.com/d/eks-cluster-overview/eks-enterprise-cluster-overview"
+
+      - alert: KubernetesMemoryPressure
+        expr: kube_node_status_condition{condition="MemoryPressure",status="true"} == 1
+        for: 2m
+        labels:
+          severity: warning
+          category: infrastructure
+          component: node
+        annotations:
+          summary: "Kubernetes node memory pressure"
+          description: "Node {{ $labels.node }} has MemoryPressure condition"
+          runbook_url: "https://runbooks.prometheus-operator.dev/runbooks/kubernetes/kubernetesmemorypressure"
+
+      - alert: KubernetesDiskPressure
+        expr: kube_node_status_condition{condition="DiskPressure",status="true"} == 1
+        for: 2m
+        labels:
+          severity: warning
+          category: infrastructure
+          component: node
+        annotations:
+          summary: "Kubernetes node disk pressure"
+          description: "Node {{ $labels.node }} has DiskPressure condition"
+          runbook_url: "https://runbooks.prometheus-operator.dev/runbooks/kubernetes/kubernetesdiskpressure"
+
+      - alert: KubernetesOutOfDisk
+        expr: kube_node_status_condition{condition="OutOfDisk",status="true"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          category: infrastructure
+          component: node
+        annotations:
+          summary: "Kubernetes node out of disk"
+          description: "Node {{ $labels.node }} has OutOfDisk condition"
+          runbook_url: "https://runbooks.prometheus-operator.dev/runbooks/kubernetes/kubernetesoutofdisk"
+
+      - alert: KubernetesOutOfCapacity
+        expr: sum by (node) ((kube_pod_status_phase{phase="Running"} == 1) + on(uid) group_left(node) (0 * kube_pod_info{pod_template_hash=""})) / sum by (node) (kube_node_status_allocatable{resource="pods"}) * 100 > 90
+        for: 2m
+        labels:
+          severity: warning
+          category: infrastructure
+          component: node
+        annotations:
+          summary: "Kubernetes node out of capacity"
+          description: "Node {{ $labels.node }} is out of capacity"
+
+  - name: eks-pod-health
+    interval: 30s
+    rules:
+      - alert: KubernetesPodCrashLooping
+        expr: increase(kube_pod_container_status_restarts_total[1h]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          category: application
+          component: pod
+        annotations:
+          summary: "Kubernetes pod crash looping"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) is crash looping"
+          runbook_url: "https://runbooks.prometheus-operator.dev/runbooks/kubernetes/kubernetespodcrashlooping"
+
+      - alert: KubernetesPodNotReady
+        expr: sum by (namespace, pod) (max by(namespace, pod) (kube_pod_status_phase{phase=~"Pending|Unknown"}) * on(namespace, pod) group_left(owner_kind) topk by(namespace, pod) (1, max by(namespace, pod, owner_kind) (kube_pod_owner{owner_kind!="Job"}))) > 0
+        for: 15m
+        labels:
+          severity: warning
+          category: application
+          component: pod
+        annotations:
+          summary: "Kubernetes Pod not ready"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been in a non-ready state for longer than 15 minutes."
+
+      - alert: KubernetesDeploymentGenerationMismatch
+        expr: kube_deployment_status_condition{condition="Progressing", status="false"} > 0
+        for: 15m
+        labels:
+          severity: warning
+          category: application
+          component: deployment
+        annotations:
+          summary: "Kubernetes Deployment generation mismatch"
+          description: "Deployment generation for {{ $labels.namespace }}/{{ $labels.deployment }} does not match, this indicates that the Deployment has failed but has not been rolled back."
+
+      - alert: KubernetesStatefulsetGenerationMismatch
+        expr: kube_statefulset_status_condition{condition="Progressing", status="false"} > 0
+        for: 15m
+        labels:
+          severity: warning
+          category: application
+          component: statefulset
+        annotations:
+          summary: "Kubernetes StatefulSet generation mismatch"
+          description: "StatefulSet generation for {{ $labels.namespace }}/{{ $labels.statefulset }} does not match, this indicates that the StatefulSet has failed but has not been rolled back."
+
+  - name: eks-resource-usage
+    interval: 30s
+    rules:
+      - alert: KubernetesNodeHighCPUUsage
+        expr: (100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 80
+        for: 10m
+        labels:
+          severity: warning
+          category: resource
+          component: cpu
+        annotations:
+          summary: "Kubernetes Node high CPU usage"
+          description: "Node {{ $labels.instance }} has high CPU usage for more than 10 minutes."
+          current_value: "{{ $value }}%"
+
+      - alert: KubernetesNodeHighMemoryUsage
+        expr: (100 * (1 - ((node_memory_MemAvailable_bytes) / (node_memory_MemTotal_bytes)))) > 85
+        for: 10m
+        labels:
+          severity: warning
+          category: resource
+          component: memory
+        annotations:
+          summary: "Kubernetes Node high memory usage"
+          description: "Node {{ $labels.instance }} has high memory usage for more than 10 minutes."
+          current_value: "{{ $value }}%"
+
+      - alert: KubernetesNodeFilesystemSpaceFillingUp
+        expr: (100 - ((node_filesystem_avail_bytes * 100) / node_filesystem_size_bytes)) > 85
+        for: 1h
+        labels:
+          severity: warning
+          category: resource
+          component: disk
+        annotations:
+          summary: "Kubernetes node filesystem is filling up"
+          description: "Filesystem on {{ $labels.device }} at {{ $labels.instance }} has only {{ printf \"%.2f\" $value }}% available space left and is filling up."
+
+      - alert: KubernetesPodHighCPUUsage
+        expr: sum(rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (namespace, pod) > 1
+        for: 15m
+        labels:
+          severity: warning
+          category: resource
+          component: cpu
+        annotations:
+          summary: "Kubernetes Pod high CPU usage"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has high CPU usage for more than 15 minutes."
+          current_value: "{{ $value }} cores"
+
+      - alert: KubernetesPodHighMemoryUsage
+        expr: sum(container_memory_working_set_bytes{container!="POD",container!=""}) by (namespace, pod) / sum(kube_pod_container_resource_limits{resource="memory"}) by (namespace, pod) > 0.9
+        for: 15m
+        labels:
+          severity: warning
+          category: resource
+          component: memory
+        annotations:
+          summary: "Kubernetes Pod high memory usage"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is using more than 90% of its memory limit."
+          current_value: "{{ $value | humanizePercentage }}"
+
+  - name: eks-etcd-health
+    interval: 30s
+    rules:
+      - alert: etcdInsufficientMembers
+        expr: sum(up{job=~".*etcd.*"}) < ((count(up{job=~".*etcd.*"}) + 1) / 2)
+        for: 3m
+        labels:
+          severity: critical
+          category: infrastructure
+          component: etcd
+        annotations:
+          summary: "etcd cluster insufficient members"
+          description: "If one more etcd member goes down the cluster will be unavailable"
+
+      - alert: etcdNoLeader
+        expr: etcd_server_has_leader{job=~".*etcd.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: infrastructure
+          component: etcd
+        annotations:
+          summary: "etcd cluster has no leader"
+          description: "etcd cluster \"{{ $labels.job }}\" has no leader"
+
+      - alert: etcdHighNumberOfLeaderChanges
+        expr: increase(etcd_server_leader_changes_seen_total{job=~".*etcd.*"}[1h]) > 3
+        for: 5m
+        labels:
+          severity: warning
+          category: infrastructure
+          component: etcd
+        annotations:
+          summary: "etcd cluster has high number of leader changes"
+          description: "etcd cluster \"{{ $labels.job }}\" has seen {{ $value }} leader changes within the last hour"
+
+  - name: eks-api-server-health
+    interval: 30s
+    rules:
+      - alert: KubernetesAPIServerDown
+        expr: up{job="apiserver"} == 0
+        for: 15m
+        labels:
+          severity: critical
+          category: infrastructure
+          component: api-server
+        annotations:
+          summary: "Kubernetes API server is down"
+          description: "KubernetesAPIServer has disappeared from Prometheus target discovery."
+
+      - alert: KubernetesAPIServerLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(apiserver_request_duration_seconds_bucket{subresource!="log",verb!~"^(?:CONNECT|WATCHLIST|WATCH|PROXY)$"}[5m])) without(instance, pod)) > 1
+        for: 10m
+        labels:
+          severity: warning
+          category: performance
+          component: api-server
+        annotations:
+          summary: "Kubernetes API server latency is high"
+          description: "The API server has a 99th percentile latency of {{ $value }} seconds for {{ $labels.verb }} {{ $labels.resource }}."
+
+      - alert: KubernetesAPIServerRequestErrors
+        expr: sum(rate(apiserver_request_total{code=~"^(?:5..)$"}[5m])) without(instance, pod) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          category: reliability
+          component: api-server
+        annotations:
+          summary: "Kubernetes API server request errors"
+          description: "The API server is returning errors for {{ $value | humanizePercentage }} of requests."
+
+  - name: eks-network-health
+    interval: 30s
+    rules:
+      - alert: KubernetesNetworkUnavailable
+        expr: kube_node_status_condition{condition="NetworkUnavailable",status="true"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          category: infrastructure
+          component: network
+        annotations:
+          summary: "Kubernetes network unavailable"
+          description: "Node {{ $labels.node }} reports NetworkUnavailable"
+
+      - alert: KubernetesPodNetworkErrors
+        expr: increase(container_network_receive_errors_total[1m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          category: network
+          component: pod
+        annotations:
+          summary: "Kubernetes pod network errors"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.interface }}) has encountered {{ $value }} receive errors in the last minute."
+
+  - name: eks-storage-health
+    interval: 30s
+    rules:
+      - alert: KubernetesPersistentVolumeFillingUp
+        expr: kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes < 0.15
+        for: 1m
+        labels:
+          severity: critical
+          category: storage
+          component: pvc
+        annotations:
+          summary: "Kubernetes PersistentVolume is filling up"
+          description: "PersistentVolume {{ $labels.persistentvolumeclaim }} in {{ $labels.namespace }} is only {{ $value | humanizePercentage }} free."
+
+      - alert: KubernetesPersistentVolumeErrors
+        expr: kube_persistentvolume_status_phase{phase=~"Failed|Pending"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          category: storage
+          component: pv
+        annotations:
+          summary: "Kubernetes PersistentVolume has errors"
+          description: "PersistentVolume {{ $labels.persistentvolume }} is in {{ $labels.phase }} phase."
+
+  - name: eks-cost-optimization
+    interval: 300s
+    rules:
+      - alert: UnderutilizedNodes
+        expr: avg_over_time((100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100))[1h:5m]) < 20 and avg_over_time((100 * (1 - ((node_memory_MemAvailable_bytes) / (node_memory_MemTotal_bytes))))[1h:5m]) < 40
+        for: 2h
+        labels:
+          severity: info
+          category: cost
+          component: optimization
+        annotations:
+          summary: "Node is underutilized"
+          description: "Node {{ $labels.instance }} has been running at low CPU ({{ $value }}%) and memory utilization for 2 hours."
+          action: "Consider scaling down or consolidating workloads"
+
+      - alert: HighSpotInstanceInterruptions
+        expr: increase(node_spot_interruption_warning_total[1h]) > 5
+        for: 0m
+        labels:
+          severity: warning
+          category: cost
+          component: spot-instances
+        annotations:
+          summary: "High number of spot instance interruptions"
+          description: "{{ $value }} spot instances have been interrupted in the last hour."
+          action: "Review spot instance diversification strategy"
+
+  - name: eks-security-alerts
+    interval: 60s
+    rules:
+      - alert: KubernetesUnauthorizedAPIAccess
+        expr: increase(apiserver_audit_total{verb!~"get|list|watch"}[10m]) > 100
+        for: 0m
+        labels:
+          severity: warning
+          category: security
+          component: rbac
+        annotations:
+          summary: "High number of unauthorized API access attempts"
+          description: "Detected {{ $value }} unauthorized API access attempts in the last 10 minutes."
+
+      - alert: KubernetesPrivilegedContainerRunning
+        expr: kube_pod_container_status_running * on (namespace,pod,container) kube_pod_spec_container_security_context_privileged > 0
+        for: 5m
+        labels:
+          severity: warning
+          category: security
+          component: container
+        annotations:
+          summary: "Privileged container is running"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) is running in privileged mode."
+
+      - alert: KubernetesContainerWithoutSecurityContext
+        expr: kube_pod_container_status_running unless on (namespace,pod,container) kube_pod_spec_container_security_context_readonlyfs_root
+        for: 5m
+        labels:
+          severity: info
+          category: security
+          component: container
+        annotations:
+          summary: "Container running without security context"
+          description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) is running without a proper security context."

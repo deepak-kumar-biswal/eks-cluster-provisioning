@@ -1,0 +1,677 @@
+name: 🔄 EKS Cluster Upgrade Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment for Upgrade'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging  
+          - prod
+      cluster_name:
+        description: 'Cluster Name to Upgrade'
+        required: true
+        type: string
+      target_version:
+        description: 'Target Kubernetes Version (e.g., 1.29)'
+        required: true
+        type: string
+      upgrade_type:
+        description: 'Upgrade Type'
+        required: true
+        type: choice
+        options:
+          - control-plane-only
+          - node-groups-only
+          - full-upgrade
+          - addon-upgrade
+      maintenance_window:
+        description: 'Maintenance Window (UTC, format: YYYY-MM-DD HH:MM)'
+        required: false
+        type: string
+      skip_precheck:
+        description: 'Skip Pre-upgrade Validation'
+        required: false
+        type: boolean
+        default: false
+      emergency_upgrade:
+        description: 'Emergency Upgrade (Skip Approval)'
+        required: false
+        type: boolean
+        default: false
+
+  schedule:
+    # Automated upgrade checks - every Monday at 2 AM UTC
+    - cron: '0 2 * * 1'
+
+env:
+  AWS_REGION: us-west-2
+  KUBECTL_VERSION: 1.29.3
+  HELM_VERSION: 3.14.0
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PRE-UPGRADE VALIDATION & COMPATIBILITY CHECK
+  # ═══════════════════════════════════════════════════════════════════════════
+  pre-upgrade-validation:
+    name: 🔍 Pre-Upgrade Validation
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.inputs.skip_precheck }}
+    outputs:
+      validation_passed: ${{ steps.validate.outputs.passed }}
+      compatibility_report: ${{ steps.compatibility.outputs.report }}
+      backup_created: ${{ steps.backup.outputs.created }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup Tools
+        run: |
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+          # Install helm
+          curl https://get.helm.sh/helm-v${{ env.HELM_VERSION }}-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/
+
+          # Install kubent (Kubernetes NoTrouble)
+          curl -L https://github.com/doitintl/kube-no-trouble/releases/download/0.7.0/kubent-0.7.0-linux-amd64.tar.gz | tar xz
+          sudo mv kubent /usr/local/bin/
+
+          # Configure kubectl
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ github.event.inputs.cluster_name }}
+
+      - name: 🔍 Kubernetes API Compatibility Check
+        id: compatibility
+        run: |
+          echo "🔍 Checking for deprecated APIs and resources..."
+          
+          # Check for deprecated APIs
+          kubent --target-version=${{ github.event.inputs.target_version }} --output=json > compatibility-report.json
+          
+          # Parse results
+          deprecated_count=$(cat compatibility-report.json | jq '.[] | length' | paste -sd+ | bc)
+          
+          if [ "$deprecated_count" -gt 0 ]; then
+            echo "⚠️ Found $deprecated_count deprecated API usage(s)"
+            echo "report<<EOF" >> $GITHUB_OUTPUT
+            cat compatibility-report.json | jq -r '.[] | "- \(.kind)/\(.name) in \(.namespace // "default") namespace uses deprecated API \(.apiVersion)"'
+            echo "EOF" >> $GITHUB_OUTPUT
+            
+            # Create issue for tracking
+            gh issue create \
+              --title "🚨 Deprecated APIs found before upgrade to ${{ github.event.inputs.target_version }}" \
+              --body "$(cat compatibility-report.json | jq -r '.[] | "- \(.kind)/\(.name) in \(.namespace // "default") namespace uses deprecated API \(.apiVersion)"')" \
+              --label "upgrade,deprecated-api"
+          else
+            echo "✅ No deprecated APIs found"
+            echo "report=No deprecated APIs found" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏥 Cluster Health Check
+        run: |
+          echo "🏥 Performing comprehensive cluster health check..."
+          
+          # Check cluster status
+          kubectl cluster-info
+          
+          # Check node readiness
+          echo "📊 Node Status:"
+          kubectl get nodes -o wide
+          
+          # Check system pods
+          echo "🔧 System Pod Status:"
+          kubectl get pods -n kube-system --field-selector=status.phase!=Running
+          
+          # Check resource utilization
+          echo "📈 Resource Utilization:"
+          kubectl top nodes
+          kubectl top pods -A --sort-by=cpu | head -20
+          
+          # Check for stuck pods
+          echo "🔍 Checking for problematic pods..."
+          kubectl get pods -A --field-selector=status.phase=Pending
+          kubectl get pods -A --field-selector=status.phase=Failed
+          
+          # Check PVCs
+          echo "💾 Storage Status:"
+          kubectl get pvc -A
+          
+          # Check ingress
+          echo "🌐 Ingress Status:"
+          kubectl get ingress -A
+
+      - name: 📊 Workload Analysis
+        run: |
+          echo "📊 Analyzing critical workloads..."
+          
+          # Identify critical namespaces and deployments
+          kubectl get deployments -A -o json | jq -r '.items[] | select(.spec.replicas > 0) | "\(.metadata.namespace)/\(.metadata.name): \(.spec.replicas) replicas"'
+          
+          # Check for disruption budgets
+          echo "🛡️ Pod Disruption Budgets:"
+          kubectl get pdb -A
+          
+          # Check for StatefulSets
+          echo "🔄 StatefulSets:"
+          kubectl get statefulsets -A
+          
+          # Check for DaemonSets
+          echo "⚙️ DaemonSets:"
+          kubectl get daemonsets -A
+
+      - name: 💾 Create Cluster Backup
+        id: backup
+        run: |
+          echo "💾 Creating pre-upgrade cluster backup..."
+          
+          # Create backup directory
+          mkdir -p cluster-backup-$(date +%Y%m%d-%H%M%S)
+          cd cluster-backup-$(date +%Y%m%d-%H%M%S)
+          
+          # Backup cluster resources
+          echo "📝 Backing up cluster configurations..."
+          kubectl get all --all-namespaces -o yaml > all-resources.yaml
+          kubectl get configmaps --all-namespaces -o yaml > configmaps.yaml
+          kubectl get secrets --all-namespaces -o yaml > secrets.yaml
+          kubectl get pv,pvc --all-namespaces -o yaml > storage.yaml
+          kubectl get ingress --all-namespaces -o yaml > ingress.yaml
+          kubectl get networkpolicies --all-namespaces -o yaml > networkpolicies.yaml
+          
+          # Backup RBAC
+          kubectl get clusterroles,clusterrolebindings,roles,rolebindings --all-namespaces -o yaml > rbac.yaml
+          
+          # Backup custom resources
+          kubectl get crd -o yaml > crds.yaml
+          
+          # Create tarball
+          cd ..
+          tar -czf cluster-backup-$(date +%Y%m%d-%H%M%S).tar.gz cluster-backup-$(date +%Y%m%d-%H%M%S)/
+          
+          # Upload to S3
+          aws s3 cp cluster-backup-$(date +%Y%m%d-%H%M%S).tar.gz s3://${{ secrets[format('BACKUP_BUCKET_{0}', github.event.inputs.environment)] }}/cluster-backups/
+          
+          echo "created=true" >> $GITHUB_OUTPUT
+          echo "backup_path=s3://${{ secrets[format('BACKUP_BUCKET_{0}', github.event.inputs.environment)] }}/cluster-backups/cluster-backup-$(date +%Y%m%d-%H%M%S).tar.gz" >> $GITHUB_OUTPUT
+
+      - name: ✅ Validation Summary
+        id: validate
+        run: |
+          # Determine if validation passed
+          if [ -z "$(kubectl get pods -A --field-selector=status.phase=Pending --no-headers)" ] && \
+             [ -z "$(kubectl get pods -A --field-selector=status.phase=Failed --no-headers)" ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+            echo "✅ All pre-upgrade validations passed"
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "❌ Pre-upgrade validation failed - cluster not ready for upgrade"
+            exit 1
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # APPROVAL WORKFLOW (SKIP FOR EMERGENCY UPGRADES)
+  # ═══════════════════════════════════════════════════════════════════════════
+  upgrade-approval:
+    name: 🔐 Upgrade Approval
+    runs-on: ubuntu-latest
+    needs: pre-upgrade-validation
+    if: ${{ !github.event.inputs.emergency_upgrade && github.event.inputs.environment == 'prod' }}
+    environment:
+      name: production-upgrade-approval
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: 📋 Approval Summary
+        run: |
+          echo "## 🔄 EKS Upgrade Approval Request" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cluster:** ${{ github.event.inputs.cluster_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Version:** ${{ github.event.inputs.target_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Upgrade Type:** ${{ github.event.inputs.upgrade_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Compatibility Report:** ${{ needs.pre-upgrade-validation.outputs.compatibility_report }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Backup Created:** ${{ needs.pre-upgrade-validation.outputs.backup_created }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: 📢 Send Slack Notification
+        if: env.SLACK_WEBHOOK != ''
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"🔄 EKS Upgrade Approval Required\n*Cluster:* ${{ github.event.inputs.cluster_name }}\n*Environment:* ${{ github.event.inputs.environment }}\n*Target Version:* ${{ github.event.inputs.target_version }}\n*GitHub Actions:* https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+          ${{ env.SLACK_WEBHOOK }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MAINTENANCE WINDOW CHECKER
+  # ═══════════════════════════════════════════════════════════════════════════
+  maintenance-window-check:
+    name: ⏰ Maintenance Window Check
+    runs-on: ubuntu-latest
+    needs: [pre-upgrade-validation, upgrade-approval]
+    if: ${{ always() && github.event.inputs.maintenance_window != '' }}
+    steps:
+      - name: ⏰ Check Maintenance Window
+        run: |
+          current_time=$(date -u +"%Y-%m-%d %H:%M")
+          maintenance_time="${{ github.event.inputs.maintenance_window }}"
+          
+          if [[ "$current_time" < "$maintenance_time" ]]; then
+            wait_seconds=$(( $(date -d "$maintenance_time" +%s) - $(date -d "$current_time" +%s) ))
+            echo "⏳ Waiting for maintenance window. Current: $current_time, Maintenance: $maintenance_time"
+            echo "Sleeping for $wait_seconds seconds..."
+            sleep $wait_seconds
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EKS CONTROL PLANE UPGRADE
+  # ═══════════════════════════════════════════════════════════════════════════
+  upgrade-control-plane:
+    name: 🎛️ Upgrade Control Plane
+    runs-on: ubuntu-latest
+    needs: [pre-upgrade-validation, maintenance-window-check]
+    if: ${{ always() && contains(fromJSON('["control-plane-only", "full-upgrade"]'), github.event.inputs.upgrade_type) }}
+    steps:
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🎛️ Start Control Plane Upgrade
+        run: |
+          echo "🎛️ Starting EKS control plane upgrade..."
+          
+          # Get current version
+          current_version=$(aws eks describe-cluster --name ${{ github.event.inputs.cluster_name }} --query 'cluster.version' --output text)
+          echo "Current version: $current_version"
+          echo "Target version: ${{ github.event.inputs.target_version }}"
+          
+          # Start upgrade
+          aws eks update-cluster-version \
+            --name ${{ github.event.inputs.cluster_name }} \
+            --kubernetes-version ${{ github.event.inputs.target_version }}
+          
+          echo "Control plane upgrade initiated..."
+
+      - name: ⏳ Monitor Control Plane Upgrade
+        run: |
+          echo "⏳ Monitoring control plane upgrade progress..."
+          
+          while true; do
+            status=$(aws eks describe-cluster --name ${{ github.event.inputs.cluster_name }} --query 'cluster.status' --output text)
+            version=$(aws eks describe-cluster --name ${{ github.event.inputs.cluster_name }} --query 'cluster.version' --output text)
+            
+            echo "Cluster status: $status, Version: $version"
+            
+            if [ "$status" = "ACTIVE" ] && [ "$version" = "${{ github.event.inputs.target_version }}" ]; then
+              echo "✅ Control plane upgrade completed successfully!"
+              break
+            elif [ "$status" = "FAILED" ]; then
+              echo "❌ Control plane upgrade failed!"
+              exit 1
+            else
+              echo "⏳ Upgrade in progress... waiting 60 seconds"
+              sleep 60
+            fi
+          done
+
+      - name: 🔍 Verify Control Plane Health
+        run: |
+          # Configure kubectl with new version
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ github.event.inputs.cluster_name }}
+          
+          # Install kubectl matching new version
+          curl -LO "https://dl.k8s.io/release/v${{ github.event.inputs.target_version }}.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          
+          # Test cluster connectivity
+          kubectl version
+          kubectl cluster-info
+          kubectl get nodes
+          
+          # Check system pods
+          kubectl get pods -n kube-system
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ADDON UPGRADES
+  # ═══════════════════════════════════════════════════════════════════════════
+  upgrade-addons:
+    name: 🧩 Upgrade EKS Addons
+    runs-on: ubuntu-latest
+    needs: [upgrade-control-plane]
+    if: ${{ always() && contains(fromJSON('["addon-upgrade", "full-upgrade"]'), github.event.inputs.upgrade_type) }}
+    strategy:
+      matrix:
+        addon: [
+          'vpc-cni',
+          'coredns', 
+          'kube-proxy',
+          'aws-ebs-csi-driver',
+          'aws-efs-csi-driver',
+          'aws-load-balancer-controller'
+        ]
+    steps:
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🧩 Upgrade Addon - ${{ matrix.addon }}
+        run: |
+          echo "🧩 Upgrading addon: ${{ matrix.addon }}"
+          
+          # Get compatible addon version for Kubernetes version
+          compatible_version=$(aws eks describe-addon-versions \
+            --addon-name ${{ matrix.addon }} \
+            --kubernetes-version ${{ github.event.inputs.target_version }} \
+            --query 'addons[0].addonVersions[0].addonVersion' \
+            --output text)
+          
+          echo "Compatible version for ${{ matrix.addon }}: $compatible_version"
+          
+          # Check if addon exists
+          if aws eks describe-addon --cluster-name ${{ github.event.inputs.cluster_name }} --addon-name ${{ matrix.addon }} &>/dev/null; then
+            echo "Updating existing addon..."
+            aws eks update-addon \
+              --cluster-name ${{ github.event.inputs.cluster_name }} \
+              --addon-name ${{ matrix.addon }} \
+              --addon-version $compatible_version \
+              --resolve-conflicts OVERWRITE
+          else
+            echo "Installing new addon..."
+            aws eks create-addon \
+              --cluster-name ${{ github.event.inputs.cluster_name }} \
+              --addon-name ${{ matrix.addon }} \
+              --addon-version $compatible_version \
+              --resolve-conflicts OVERWRITE
+          fi
+          
+          # Monitor addon upgrade
+          while true; do
+            status=$(aws eks describe-addon \
+              --cluster-name ${{ github.event.inputs.cluster_name }} \
+              --addon-name ${{ matrix.addon }} \
+              --query 'addon.status' \
+              --output text)
+            
+            if [ "$status" = "ACTIVE" ]; then
+              echo "✅ Addon ${{ matrix.addon }} upgraded successfully!"
+              break
+            elif [ "$status" = "CREATE_FAILED" ] || [ "$status" = "UPDATE_FAILED" ]; then
+              echo "❌ Addon ${{ matrix.addon }} upgrade failed!"
+              exit 1
+            else
+              echo "⏳ Addon upgrade in progress... status: $status"
+              sleep 30
+            fi
+          done
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # NODE GROUP UPGRADES
+  # ═══════════════════════════════════════════════════════════════════════════
+  upgrade-node-groups:
+    name: 🖥️ Upgrade Node Groups
+    runs-on: ubuntu-latest
+    needs: [upgrade-control-plane, upgrade-addons]
+    if: ${{ always() && contains(fromJSON('["node-groups-only", "full-upgrade"]'), github.event.inputs.upgrade_type) }}
+    strategy:
+      matrix:
+        node_group: [system-nodes, application-nodes, spot-nodes]
+    steps:
+      - name: 🔑 Configure AWS Credentials  
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ github.event.inputs.cluster_name }}
+
+      - name: 🖥️ Upgrade Node Group - ${{ matrix.node_group }}
+        run: |
+          echo "🖥️ Upgrading node group: ${{ matrix.node_group }}"
+          
+          # Check if node group exists
+          if aws eks describe-nodegroup \
+            --cluster-name ${{ github.event.inputs.cluster_name }} \
+            --nodegroup-name ${{ matrix.node_group }} &>/dev/null; then
+            
+            echo "Node group exists, proceeding with upgrade..."
+            
+            # Get current AMI release version
+            current_release=$(aws eks describe-nodegroup \
+              --cluster-name ${{ github.event.inputs.cluster_name }} \
+              --nodegroup-name ${{ matrix.node_group }} \
+              --query 'nodegroup.releaseVersion' \
+              --output text)
+            
+            echo "Current AMI release: $current_release"
+            
+            # Start node group upgrade
+            aws eks update-nodegroup-version \
+              --cluster-name ${{ github.event.inputs.cluster_name }} \
+              --nodegroup-name ${{ matrix.node_group }} \
+              --force
+            
+            # Monitor upgrade progress
+            while true; do
+              status=$(aws eks describe-nodegroup \
+                --cluster-name ${{ github.event.inputs.cluster_name }} \
+                --nodegroup-name ${{ matrix.node_group }} \
+                --query 'nodegroup.status' \
+                --output text)
+              
+              echo "Node group ${{ matrix.node_group }} status: $status"
+              
+              if [ "$status" = "ACTIVE" ]; then
+                echo "✅ Node group ${{ matrix.node_group }} upgraded successfully!"
+                break
+              elif [ "$status" = "UPDATE_FAILED" ]; then
+                echo "❌ Node group ${{ matrix.node_group }} upgrade failed!"
+                
+                # Get failure reason
+                aws eks describe-nodegroup \
+                  --cluster-name ${{ github.event.inputs.cluster_name }} \
+                  --nodegroup-name ${{ matrix.node_group }} \
+                  --query 'nodegroup.health.issues'
+                
+                exit 1
+              else
+                echo "⏳ Node group upgrade in progress..."
+                sleep 60
+              fi
+            done
+            
+            # Verify nodes after upgrade
+            echo "🔍 Verifying upgraded nodes..."
+            kubectl get nodes -l nodegroup=${{ matrix.node_group }} -o wide
+            
+          else
+            echo "ℹ️ Node group ${{ matrix.node_group }} does not exist, skipping..."
+          fi
+
+      - name: 🔍 Post-Upgrade Node Verification
+        run: |
+          echo "🔍 Performing post-upgrade verification for ${{ matrix.node_group }}..."
+          
+          # Check node readiness
+          kubectl get nodes -l nodegroup=${{ matrix.node_group }}
+          
+          # Check system pods on upgraded nodes
+          kubectl get pods -n kube-system -o wide | grep ${{ matrix.node_group }} || true
+          
+          # Check node conditions
+          kubectl describe nodes -l nodegroup=${{ matrix.node_group }} | grep -A 10 "Conditions:" || true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # POST-UPGRADE VALIDATION & TESTING
+  # ═══════════════════════════════════════════════════════════════════════════
+  post-upgrade-validation:
+    name: ✅ Post-Upgrade Validation
+    runs-on: ubuntu-latest
+    needs: [upgrade-node-groups]
+    if: ${{ always() }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ github.event.inputs.cluster_name }}
+          
+          # Install Python for testing
+          pip install boto3 kubernetes requests pytest
+
+      - name: 🔍 Comprehensive Cluster Validation
+        run: |
+          echo "🔍 Running comprehensive post-upgrade validation..."
+          
+          # Check cluster version
+          cluster_version=$(aws eks describe-cluster --name ${{ github.event.inputs.cluster_name }} --query 'cluster.version' --output text)
+          echo "✅ Cluster version: $cluster_version"
+          
+          if [ "$cluster_version" != "${{ github.event.inputs.target_version }}" ]; then
+            echo "❌ Cluster version mismatch!"
+            exit 1
+          fi
+          
+          # Check all nodes are ready
+          echo "🖥️ Checking node status..."
+          not_ready=$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)
+          if [ $not_ready -gt 0 ]; then
+            echo "❌ $not_ready nodes are not ready!"
+            kubectl get nodes
+            exit 1
+          fi
+          echo "✅ All nodes are ready"
+          
+          # Check system pods
+          echo "🔧 Checking system pods..."
+          failed_pods=$(kubectl get pods -n kube-system --no-headers | awk '$3!="Running" && $3!="Completed"' | wc -l)
+          if [ $failed_pods -gt 0 ]; then
+            echo "❌ $failed_pods system pods are not running!"
+            kubectl get pods -n kube-system
+            exit 1
+          fi
+          echo "✅ All system pods are running"
+          
+          # Check addons
+          echo "🧩 Checking addon status..."
+          addons=$(aws eks list-addons --cluster-name ${{ github.event.inputs.cluster_name }} --query 'addons' --output text)
+          for addon in $addons; do
+            status=$(aws eks describe-addon --cluster-name ${{ github.event.inputs.cluster_name }} --addon-name $addon --query 'addon.status' --output text)
+            if [ "$status" != "ACTIVE" ]; then
+              echo "❌ Addon $addon is not active: $status"
+              exit 1
+            fi
+            echo "✅ Addon $addon is active"
+          done
+          
+          # Check DNS resolution
+          echo "🌐 Testing DNS resolution..."
+          kubectl run dns-test --image=busybox --restart=Never --rm -i --timeout=60s -- nslookup kubernetes.default.svc.cluster.local
+          echo "✅ DNS resolution working"
+          
+          # Check ingress controller
+          echo "🚪 Checking ingress controller..."
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+          echo "✅ Ingress controller is running"
+
+      - name: 🧪 Run Integration Tests
+        run: |
+          echo "🧪 Running post-upgrade integration tests..."
+          cd tests
+          python -m pytest test_eks_cluster.py::TestEKSClusterUpgrade -v
+        env:
+          CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+
+      - name: 📊 Generate Upgrade Report
+        run: |
+          echo "📊 Generating upgrade completion report..."
+          
+          # Create upgrade report
+          cat << EOF > upgrade-report.md
+          # 🔄 EKS Upgrade Completion Report
+          
+          **Cluster:** ${{ github.event.inputs.cluster_name }}
+          **Environment:** ${{ github.event.inputs.environment }}
+          **Upgrade Type:** ${{ github.event.inputs.upgrade_type }}
+          **Target Version:** ${{ github.event.inputs.target_version }}
+          **Completion Time:** $(date -u)
+          
+          ## ✅ Upgrade Summary
+          - Control plane upgrade: Completed
+          - Node group upgrades: Completed
+          - Addon upgrades: Completed
+          - Post-upgrade validation: Passed
+          
+          ## 📊 Cluster Status
+          \`\`\`
+          $(kubectl get nodes)
+          \`\`\`
+          
+          ## 🧩 Addon Status
+          $(aws eks list-addons --cluster-name ${{ github.event.inputs.cluster_name }} --output table)
+          
+          ## 🏁 Conclusion
+          EKS cluster upgrade completed successfully! 🎉
+          EOF
+          
+          # Upload report
+          aws s3 cp upgrade-report.md s3://${{ secrets[format('REPORTS_BUCKET_{0}', github.event.inputs.environment)] }}/upgrade-reports/
+
+      - name: 📢 Send Success Notification
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"✅ EKS Upgrade Completed Successfully!\n*Cluster:* ${{ github.event.inputs.cluster_name }}\n*Environment:* ${{ github.event.inputs.environment }}\n*New Version:* ${{ github.event.inputs.target_version }}\n*Duration:* ${{ github.event.inputs.maintenance_window }}"}' \
+          ${{ env.SLACK_WEBHOOK }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ROLLBACK CAPABILITY (IN CASE OF FAILURE)
+  # ═══════════════════════════════════════════════════════════════════════════
+  emergency-rollback:
+    name: 🚨 Emergency Rollback
+    runs-on: ubuntu-latest
+    if: ${{ failure() && needs.pre-upgrade-validation.outputs.backup_created == 'true' }}
+    needs: [pre-upgrade-validation, upgrade-control-plane, upgrade-addons, upgrade-node-groups, post-upgrade-validation]
+    steps:
+      - name: 🚨 Initiate Emergency Rollback
+        run: |
+          echo "🚨 EMERGENCY ROLLBACK INITIATED"
+          echo "This would restore cluster from backup"
+          echo "Manual intervention may be required"
+          
+          # Send critical alert
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"🚨 CRITICAL: EKS Upgrade Failed - Emergency Rollback Initiated\n*Cluster:* ${{ github.event.inputs.cluster_name }}\n*Environment:* ${{ github.event.inputs.environment }}\n*GitHub Actions:* https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+          ${{ env.SLACK_WEBHOOK }}

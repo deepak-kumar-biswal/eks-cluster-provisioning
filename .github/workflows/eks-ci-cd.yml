@@ -1,0 +1,606 @@
+name: 🚀 Enterprise EKS Cluster CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, 'release/*']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+          - upgrade
+          - chaos-test
+      cluster_name:
+        description: 'Cluster Name (optional, for targeted operations)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  TF_VERSION: 1.8.0
+  KUBECTL_VERSION: 1.28.9
+  HELM_VERSION: 3.12.3
+  TRIVY_VERSION: 0.52.2
+
+permissions:
+  id-token: write   # for OIDC
+  contents: read    # for checking out code
+  security-events: write  # for SARIF uploads
+  pull-requests: write    # for PR comments
+  issues: write     # for issue creation
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # VALIDATION & SECURITY SCANNING
+  # ═══════════════════════════════════════════════════════════════════════════
+  validate:
+    name: 🔍 Validate & Security Scan
+    runs-on: ubuntu-latest
+    outputs:
+      terraform_changed: ${{ steps.changes.outputs.terraform }}
+      k8s_changed: ${{ steps.changes.outputs.k8s }}
+      security_passed: ${{ steps.security.outputs.passed }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 Detect Changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            terraform:
+              - 'terraform/**'
+              - '*.tf'
+              - '*.tfvars'
+            k8s:
+              - 'argocd/**'
+              - 'monitoring/**'
+              - '*.yaml'
+              - '*.yml'
+
+      - name: 🛡️ Security Scanning with Trivy
+        uses: aquasecurity/trivy-action@master
+        id: security
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+        continue-on-error: true
+
+      - name: 📤 Upload SARIF Results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: ✅ Set Security Status
+        id: security
+        run: |
+          if [ "${{ steps.security.outcome }}" == "success" ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Security issues found. Please review the Security tab."
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TERRAFORM VALIDATION & PLANNING
+  # ═══════════════════════════════════════════════════════════════════════════
+  terraform-validate:
+    name: 🏗️ Terraform Validation
+    runs-on: ubuntu-latest
+    needs: validate
+    if: needs.validate.outputs.terraform_changed == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', matrix.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-EKS-${{ matrix.environment }}
+
+      - name: 🎯 Terraform Init
+        run: |
+          cd terraform/environments/${{ matrix.environment }}
+          terraform init -backend-config="bucket=${{ secrets[format('TF_STATE_BUCKET_{0}', matrix.environment)] }}"
+
+      - name: 🔍 Terraform Validate
+        run: |
+          cd terraform/environments/${{ matrix.environment }}
+          terraform validate
+
+      - name: 📋 Terraform Plan
+        id: plan
+        run: |
+          cd terraform/environments/${{ matrix.environment }}
+          terraform plan -var-file="${{ matrix.environment }}.tfvars" -out=tfplan -no-color
+          terraform show -json tfplan > tfplan.json
+
+      - name: 💰 Cost Estimation (Infracost)
+        uses: infracost/infracost-gh-action@master
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          config-file: .infracost.yml
+          usage-file: infracost-usage.yml
+
+      - name: 🔒 Terraform Security Scan (tfsec)
+        uses: aquasecurity/tfsec-sarif-action@master
+        with:
+          sarif_file: tfsec.sarif
+
+      - name: 📤 Upload tfsec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec.sarif
+
+      - name: 📝 Update PR with Plan
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/environments/${{ matrix.environment }}/tfplan.json', 'utf8');
+            const body = `## 📋 Terraform Plan - ${{ matrix.environment }}
+            
+            <details>
+            <summary>Show Plan</summary>
+            
+            \`\`\`json
+            ${JSON.stringify(JSON.parse(plan), null, 2)}
+            \`\`\`
+            
+            </details>`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TERRAFORM APPLY
+  # ═══════════════════════════════════════════════════════════════════════════
+  terraform-apply:
+    name: 🚀 Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [validate, terraform-validate]
+    if: |
+      (github.ref == 'refs/heads/main' && needs.validate.outputs.security_passed == 'true') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment: 
+      name: ${{ github.event.inputs.environment || 'dev' }}
+      url: https://${{ steps.deploy.outputs.cluster_endpoint }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment || 'dev')] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🚀 Deploy Infrastructure
+        id: deploy
+        run: |
+          ENV=${{ github.event.inputs.environment || 'dev' }}
+          cd terraform/environments/$ENV
+          
+          terraform init -backend-config="bucket=${{ secrets[format('TF_STATE_BUCKET_{0}', github.event.inputs.environment || 'dev')] }}"
+          terraform plan -var-file="$ENV.tfvars" -out=tfplan
+          terraform apply -auto-approve tfplan
+          
+          # Export outputs
+          CLUSTER_ENDPOINT=$(terraform output -raw cluster_endpoint)
+          echo "cluster_endpoint=$CLUSTER_ENDPOINT" >> $GITHUB_OUTPUT
+
+      - name: 📊 Generate Deployment Report
+        run: |
+          cat << EOF > deployment-report.md
+          # 🚀 EKS Cluster Deployment Report
+          
+          ## Cluster Details
+          - **Environment:** ${{ github.event.inputs.environment || 'dev' }}
+          - **Cluster Endpoint:** ${{ steps.deploy.outputs.cluster_endpoint }}
+          - **Deployed At:** $(date -u)
+          - **Commit SHA:** ${{ github.sha }}
+          
+          ## Resources Created
+          $(terraform -chdir=terraform/environments/${{ github.event.inputs.environment || 'dev' }} show -json | jq -r '.values.root_module.resources[] | "- \(.type): \(.values.name // .address)"')
+          EOF
+
+      - name: 📤 Upload Deployment Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-report-${{ github.event.inputs.environment || 'dev' }}
+          path: deployment-report.md
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # KUBERNETES & ARGOCD DEPLOYMENT
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-k8s:
+    name: 🎯 Deploy Kubernetes Applications
+    runs-on: ubuntu-latest
+    needs: terraform-apply
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment || 'dev')] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⚡ Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: 🎡 Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: 🔧 Configure kubectl
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name eks-cluster-${{ github.event.inputs.environment || 'dev' }}
+
+      - name: 🚀 Deploy ArgoCD
+        run: |
+          kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+          kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+      - name: 📦 Deploy Application Sets
+        run: |
+          kubectl apply -f argocd/applications/
+          kubectl apply -f argocd/applicationsets/
+
+      - name: 📊 Deploy Monitoring Stack
+        run: |
+          # Add Prometheus community Helm repo
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+          
+          # Deploy kube-prometheus-stack
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            -n monitoring \
+            -f monitoring/prometheus/values.yaml \
+            --wait
+
+      - name: ✅ Validate Deployment
+        run: |
+          kubectl get nodes
+          kubectl get pods -A
+          kubectl get svc -A
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TESTING & VALIDATION
+  # ═══════════════════════════════════════════════════════════════════════════
+  integration-tests:
+    name: 🧪 Integration Tests
+    runs-on: ubuntu-latest
+    needs: deploy-k8s
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install Dependencies
+        run: |
+          pip install -r tests/requirements.txt
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment || 'dev')] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🧪 Run Integration Tests
+        run: |
+          python -m pytest tests/ -v --junitxml=test-results.xml
+
+      - name: 📊 Publish Test Results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Integration Test Results
+          path: test-results.xml
+          reporter: java-junit
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # NOTIFICATION & CLEANUP
+  # ═══════════════════════════════════════════════════════════════════════════
+  notify:
+    name: 📢 Notification
+    runs-on: ubuntu-latest
+    needs: [terraform-apply, deploy-k8s, integration-tests]
+    if: always()
+    steps:
+      - name: 🔔 Slack Notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: '#eks-automation'
+          SLACK_COLOR: ${{ job.status == 'success' && 'good' || 'danger' }}
+          SLACK_MESSAGE: |
+            EKS Cluster Deployment ${{ job.status }}!
+            Environment: ${{ github.event.inputs.environment || 'dev' }}
+            Commit: ${{ github.sha }}
+            Actor: ${{ github.actor }}
+
+      - name: 📧 Teams Notification
+        if: failure()
+        uses: skitionek/notify-microsoft-teams@master
+        with:
+          webhook_url: ${{ secrets.TEAMS_WEBHOOK }}
+          summary: EKS Deployment Failed
+          title: 🚨 EKS Cluster Deployment Failure
+          text: |
+            The EKS cluster deployment has failed.
+            Please check the GitHub Actions logs for more details.
+            Environment: ${{ github.event.inputs.environment || 'dev' }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EKS CLUSTER UPGRADE WORKFLOW
+  # ═══════════════════════════════════════════════════════════════════════════
+  cluster-upgrade:
+    name: 🔄 EKS Cluster Upgrade
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'upgrade'
+    needs: [terraform-validate, security-scan]
+    environment:
+      name: ${{ github.event.inputs.environment }}-upgrade-approval
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔄 Trigger Upgrade Workflow
+        run: |
+          echo "🔄 Triggering EKS cluster upgrade workflow..."
+          gh workflow run eks-upgrade.yml \
+            -f environment=${{ github.event.inputs.environment }} \
+            -f cluster_name=${{ github.event.inputs.cluster_name || format('eks-cluster-{0}', github.event.inputs.environment) }} \
+            -f target_version="1.29" \
+            -f upgrade_type="full-upgrade" \
+            -f maintenance_window="$(date -u -d '+1 hour' +'%Y-%m-%d %H:%M')"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CHAOS ENGINEERING WORKFLOW
+  # ═══════════════════════════════════════════════════════════════════════════
+  chaos-testing:
+    name: 🐒 Chaos Engineering
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'chaos-test' && github.event.inputs.environment != 'prod'
+    needs: [deploy-k8s]
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name eks-cluster-${{ github.event.inputs.environment }}
+
+      - name: 🐒 Run Chaos Engineering Tests
+        run: |
+          echo "🐒 Running chaos engineering tests..."
+          
+          # Install Python dependencies
+          pip install pytest boto3 kubernetes requests
+          
+          # Run chaos engineering test suite
+          cd tests
+          python -m pytest test_chaos_engineering.py::TestChaosEngineering::test_pod_failure_resilience -v -s
+          python -m pytest test_chaos_engineering.py::TestChaosEngineering::test_network_partition_resilience -v -s
+          
+          echo "✅ Chaos engineering tests completed"
+        env:
+          CLUSTER_NAME: eks-cluster-${{ github.event.inputs.environment }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          CHAOS_NAMESPACE: chaos-testing
+
+      - name: 🐒 Trigger Full Chaos Suite
+        run: |
+          echo "🐒 Triggering comprehensive chaos engineering suite..."
+          gh workflow run chaos-engineering.yml \
+            -f environment=${{ github.event.inputs.environment }} \
+            -f chaos_experiment="full-chaos-suite" \
+            -f duration="10" \
+            -f intensity="medium" \
+            -f target_namespace="chaos-testing"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ENHANCED MONITORING AND ALERTING
+  # ═══════════════════════════════════════════════════════════════════════════
+  setup-enhanced-monitoring:
+    name: 📊 Enhanced Monitoring Setup
+    runs-on: ubuntu-latest
+    needs: [deploy-k8s]
+    if: needs.deploy-k8s.result == 'success' && contains(fromJSON('["apply", "upgrade"]'), github.event.inputs.action)
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment || 'dev')] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl https://get.helm.sh/helm-v${{ env.HELM_VERSION }}-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name eks-cluster-${{ github.event.inputs.environment || 'dev' }}
+
+      - name: 📊 Deploy Chaos Engineering Monitoring
+        run: |
+          echo "📊 Setting up chaos engineering specific monitoring..."
+          
+          # Create chaos monitoring namespace
+          kubectl create namespace chaos-monitoring --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy chaos experiment tracking dashboard
+          cat << 'EOF' | kubectl apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: chaos-dashboard-config
+            namespace: chaos-monitoring
+            labels:
+              grafana_dashboard: "1"
+          data:
+            chaos-experiments.json: |
+              {
+                "dashboard": {
+                  "title": "Chaos Engineering Dashboard",
+                  "tags": ["chaos", "resilience"],
+                  "panels": [
+                    {
+                      "title": "Active Chaos Experiments",
+                      "type": "stat",
+                      "targets": [{"expr": "count(chaos_mesh_experiments{status='running'})"}]
+                    },
+                    {
+                      "title": "System Recovery Time",
+                      "type": "graph",
+                      "targets": [{"expr": "histogram_quantile(0.95, rate(chaos_recovery_time_seconds_bucket[5m]))"}]
+                    },
+                    {
+                      "title": "Application Availability During Chaos",
+                      "type": "graph",
+                      "targets": [{"expr": "avg(up{job='chaos-test-apps'}) * 100"}]
+                    }
+                  ]
+                }
+              }
+          EOF
+          
+          # Deploy ServiceMonitor for chaos experiments
+          cat << 'EOF' | kubectl apply -f -
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: chaos-experiments
+            namespace: chaos-monitoring
+          spec:
+            selector:
+              matchLabels:
+                app: chaos-mesh
+            endpoints:
+            - port: http-chaos-metrics
+              path: /metrics
+              interval: 30s
+          EOF
+          
+          echo "✅ Chaos engineering monitoring deployed"
+
+      - name: 📈 Setup Resilience Metrics
+        run: |
+          echo "📈 Configuring resilience and reliability metrics..."
+          
+          # Create PrometheusRule for resilience metrics
+          cat << 'EOF' | kubectl apply -f -
+          apiVersion: monitoring.coreos.com/v1
+          kind: PrometheusRule
+          metadata:
+            name: resilience-metrics
+            namespace: monitoring
+          spec:
+            groups:
+            - name: resilience.rules
+              rules:
+              - alert: ChaosExperimentFailed
+                expr: chaos_mesh_experiments{status="failed"} > 0
+                for: 0m
+                labels:
+                  severity: warning
+                  category: chaos-engineering
+                annotations:
+                  summary: "Chaos experiment failed"
+                  description: "Chaos experiment {{ $labels.name }} has failed"
+              
+              - alert: SystemRecoveryTooSlow
+                expr: histogram_quantile(0.95, rate(chaos_recovery_time_seconds_bucket[5m])) > 300
+                for: 2m
+                labels:
+                  severity: critical
+                  category: resilience
+                annotations:
+                  summary: "System recovery time too slow"
+                  description: "95th percentile recovery time is {{ $value }}s"
+              
+              - alert: ApplicationAvailabilityDrop
+                expr: avg(up{job="chaos-test-apps"}) < 0.8
+                for: 1m
+                labels:
+                  severity: warning
+                  category: availability
+                annotations:
+                  summary: "Application availability dropped during chaos"
+                  description: "Application availability is {{ $value | humanizePercentage }}"
+          EOF
+          
+          echo "✅ Resilience metrics configured"

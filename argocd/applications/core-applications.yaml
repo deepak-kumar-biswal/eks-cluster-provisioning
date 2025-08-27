@@ -1,0 +1,480 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-bootstrap
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-bootstrap
+    app.kubernetes.io/component: bootstrap
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/argoproj/argo-cd
+    targetRevision: v2.10.4
+    path: manifests/cluster-install
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  revisionHistoryLimit: 10
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aws-load-balancer-controller
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: aws-load-balancer-controller
+    app.kubernetes.io/component: networking
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://aws.github.io/eks-charts
+    chart: aws-load-balancer-controller
+    targetRevision: 1.7.2
+    helm:
+      releaseName: aws-load-balancer-controller
+      values: |
+        clusterName: eks-enterprise-dev
+        serviceAccount:
+          create: true
+          name: aws-load-balancer-controller
+          annotations:
+            eks.amazonaws.com/role-arn: ${AWS_LOAD_BALANCER_CONTROLLER_ROLE_ARN}
+        
+        # Enhanced configuration
+        enableServiceMutatorWebhook: false
+        enableShield: false
+        enableWaf: false
+        enableWafv2: false
+        
+        # Resource limits
+        resources:
+          limits:
+            cpu: 200m
+            memory: 500Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        
+        # High availability
+        replicaCount: 2
+        
+        # Monitoring
+        enableServiceMonitor: true
+        
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+        
+        # Node selection
+        nodeSelector:
+          NodeType: system
+        
+        tolerations:
+          - key: "CriticalAddonsOnly"
+            operator: "Equal"
+            value: "true"
+            effect: "NoSchedule"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-autoscaler
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: cluster-autoscaler
+    app.kubernetes.io/component: autoscaling
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://kubernetes.github.io/autoscaler
+    chart: cluster-autoscaler
+    targetRevision: 9.29.1
+    helm:
+      releaseName: cluster-autoscaler
+      values: |
+        autoDiscovery:
+          clusterName: eks-enterprise-dev
+          enabled: true
+        
+        awsRegion: us-west-2
+        
+        serviceAccount:
+          create: true
+          name: cluster-autoscaler
+          annotations:
+            eks.amazonaws.com/role-arn: ${CLUSTER_AUTOSCALER_ROLE_ARN}
+        
+        # Resource configuration
+        resources:
+          limits:
+            cpu: 100m
+            memory: 600Mi
+          requests:
+            cpu: 100m
+            memory: 600Mi
+        
+        # Enhanced configuration
+        extraArgs:
+          v: 4
+          stderrthreshold: info
+          cloud-provider: aws
+          skip-nodes-with-local-storage: false
+          expander: least-waste
+          node-group-auto-discovery: asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/eks-enterprise-dev
+          balance-similar-node-groups: false
+          skip-nodes-with-system-pods: false
+          scale-down-enabled: true
+          scale-down-delay-after-add: 10m
+          scale-down-unneeded-time: 10m
+          scale-down-delay-after-delete: 10s
+          scale-down-delay-after-failure: 3m
+          scale-down-utilization-threshold: 0.5
+          max-node-provision-time: 15m
+        
+        # Node selection
+        nodeSelector:
+          NodeType: system
+        
+        tolerations:
+          - key: "CriticalAddonsOnly"
+            operator: "Equal"
+            value: "true"
+            effect: "NoSchedule"
+        
+        # High availability
+        replicaCount: 2
+        
+        # Pod disruption budget
+        podDisruptionBudget:
+          enabled: true
+          maxUnavailable: 1
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: metrics-server
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: metrics-server
+    app.kubernetes.io/component: monitoring
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://kubernetes-sigs.github.io/metrics-server/
+    chart: metrics-server
+    targetRevision: 3.12.0
+    helm:
+      releaseName: metrics-server
+      values: |
+        # Resource configuration
+        resources:
+          requests:
+            cpu: 100m
+            memory: 200Mi
+          limits:
+            cpu: 100m
+            memory: 200Mi
+        
+        # High availability
+        replicas: 2
+        
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+        
+        # Node selection
+        nodeSelector:
+          NodeType: system
+        
+        tolerations:
+          - key: "CriticalAddonsOnly"
+            operator: "Equal"
+            value: "true"
+            effect: "NoSchedule"
+        
+        # Enhanced arguments
+        args:
+          - --cert-dir=/tmp
+          - --secure-port=4443
+          - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+          - --kubelet-use-node-status-port
+          - --metric-resolution=15s
+          - --kubelet-insecure-tls
+        
+        # Pod disruption budget
+        podDisruptionBudget:
+          enabled: true
+          minAvailable: 1
+        
+        # Service monitor for Prometheus
+        serviceMonitor:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: prometheus-stack
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: prometheus-stack
+    app.kubernetes.io/component: monitoring
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 56.21.4
+    helm:
+      releaseName: prometheus-stack
+      values: |
+        # Global configuration
+        global:
+          resolve_timeout: 5m
+        
+        # Prometheus configuration
+        prometheus:
+          enabled: true
+          prometheusSpec:
+            retention: 15d
+            retentionSize: 50GiB
+            replicas: 2
+            
+            # Resource configuration
+            resources:
+              requests:
+                cpu: 200m
+                memory: 400Mi
+              limits:
+                cpu: 1000m
+                memory: 2Gi
+            
+            # Storage configuration
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp3
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 50Gi
+            
+            # Node selection
+            nodeSelector:
+              NodeType: system
+            
+            tolerations:
+              - key: "CriticalAddonsOnly"
+                operator: "Equal"
+                value: "true"
+                effect: "NoSchedule"
+            
+            # Enhanced configuration
+            enableAdminAPI: false
+            walCompression: true
+            
+            # Service monitor selector
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            
+            # External labels
+            externalLabels:
+              cluster: eks-enterprise-dev
+              environment: dev
+        
+        # Grafana configuration
+        grafana:
+          enabled: true
+          
+          # Admin credentials
+          adminPassword: "changeme123!"  # Change this!
+          
+          # Resource configuration
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          
+          # Persistence
+          persistence:
+            enabled: true
+            storageClassName: gp3
+            size: 10Gi
+          
+          # High availability
+          replicas: 1  # Single replica for dev
+          
+          # Service configuration
+          service:
+            type: LoadBalancer
+            annotations:
+              service.beta.kubernetes.io/aws-load-balancer-type: nlb
+              service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+          
+          # Node selection
+          nodeSelector:
+            NodeType: system
+          
+          tolerations:
+            - key: "CriticalAddonsOnly"
+              operator: "Equal"
+              value: "true"
+              effect: "NoSchedule"
+          
+          # Dashboard configuration
+          defaultDashboardsEnabled: true
+          defaultDashboardsTimezone: UTC
+          
+          # Plugin configuration
+          plugins:
+            - grafana-piechart-panel
+            - grafana-worldmap-panel
+            - grafana-clock-panel
+        
+        # AlertManager configuration
+        alertmanager:
+          enabled: true
+          alertmanagerSpec:
+            replicas: 2
+            
+            # Resource configuration
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi
+            
+            # Storage
+            storage:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp3
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 10Gi
+            
+            # Node selection
+            nodeSelector:
+              NodeType: system
+            
+            tolerations:
+              - key: "CriticalAddonsOnly"
+                operator: "Equal"
+                value: "true"
+                effect: "NoSchedule"
+        
+        # Node exporter
+        nodeExporter:
+          enabled: true
+        
+        # Kube state metrics
+        kubeStateMetrics:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

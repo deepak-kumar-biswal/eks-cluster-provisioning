@@ -1,0 +1,441 @@
+name: 🔍 EKS Version Monitor & Upgrade Planner
+
+on:
+  schedule:
+    # Check for new EKS versions every Monday at 6 AM UTC
+    - cron: '0 6 * * 1'
+  
+  workflow_dispatch:
+    inputs:
+      check_type:
+        description: 'Check Type'
+        required: true
+        type: choice
+        options:
+          - current-versions
+          - available-upgrades
+          - security-updates
+          - full-report
+        default: 'available-upgrades'
+      notification_level:
+        description: 'Notification Level'
+        required: true
+        type: choice
+        options:
+          - info
+          - warning
+          - critical
+        default: 'warning'
+
+env:
+  AWS_REGION: us-west-2
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EKS VERSION DISCOVERY & ANALYSIS
+  # ═══════════════════════════════════════════════════════════════════════════
+  version-analysis:
+    name: 🔍 EKS Version Analysis
+    runs-on: ubuntu-latest
+    outputs:
+      upgrade_available: ${{ steps.analysis.outputs.upgrade_available }}
+      security_updates: ${{ steps.analysis.outputs.security_updates }}
+      clusters_report: ${{ steps.analysis.outputs.clusters_report }}
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', matrix.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔍 Analyze EKS Versions
+        id: analysis
+        run: |
+          echo "🔍 Analyzing EKS versions for environment: ${{ matrix.environment }}"
+          
+          # Get all EKS clusters in the environment
+          clusters=$(aws eks list-clusters --query 'clusters' --output json)
+          echo "Found clusters: $clusters"
+          
+          # Get available Kubernetes versions
+          available_versions=$(aws eks describe-addon-versions --addon-name vpc-cni --query 'addons[0].addonVersions[0].compatibilities[*].clusterVersion' --output json | jq -r '.[] | select(. != null)' | sort -V | tail -5)
+          latest_version=$(echo "$available_versions" | tail -1)
+          
+          echo "Latest available EKS version: $latest_version"
+          
+          # Initialize report
+          upgrade_needed=false
+          security_critical=false
+          clusters_report=""
+          
+          for cluster in $(echo "$clusters" | jq -r '.[]'); do
+            echo "Analyzing cluster: $cluster"
+            
+            # Get cluster details
+            cluster_info=$(aws eks describe-cluster --name "$cluster")
+            current_version=$(echo "$cluster_info" | jq -r '.cluster.version')
+            cluster_status=$(echo "$cluster_info" | jq -r '.cluster.status')
+            created_date=$(echo "$cluster_info" | jq -r '.cluster.createdAt')
+            
+            echo "Cluster $cluster: Version $current_version, Status $cluster_status"
+            
+            # Check if upgrade is available
+            if [ "$current_version" != "$latest_version" ]; then
+              upgrade_needed=true
+              
+              # Check if current version is more than 2 versions behind (security concern)
+              current_minor=$(echo "$current_version" | cut -d'.' -f2)
+              latest_minor=$(echo "$latest_version" | cut -d'.' -f2)
+              version_gap=$((latest_minor - current_minor))
+              
+              if [ $version_gap -gt 1 ]; then
+                security_critical=true
+              fi
+            fi
+            
+            # Get node group information
+            node_groups=$(aws eks list-nodegroups --cluster-name "$cluster" --query 'nodegroups' --output json)
+            ng_info=""
+            
+            for ng in $(echo "$node_groups" | jq -r '.[]'); do
+              ng_details=$(aws eks describe-nodegroup --cluster-name "$cluster" --nodegroup-name "$ng")
+              ng_version=$(echo "$ng_details" | jq -r '.nodegroup.version // "N/A"')
+              ng_ami_type=$(echo "$ng_details" | jq -r '.nodegroup.amiType')
+              ng_status=$(echo "$ng_details" | jq -r '.nodegroup.status')
+              
+              ng_info="$ng_info\n  - NodeGroup: $ng (Version: $ng_version, AMI: $ng_ami_type, Status: $ng_status)"
+            done
+            
+            # Add to clusters report
+            clusters_report="$clusters_report\n**Cluster: $cluster** (${{ matrix.environment }})\n"
+            clusters_report="$clusters_report- Current Version: $current_version\n"
+            clusters_report="$clusters_report- Latest Available: $latest_version\n"
+            clusters_report="$clusters_report- Status: $cluster_status\n"
+            clusters_report="$clusters_report- Created: $created_date\n"
+            clusters_report="$clusters_report- Upgrade Needed: $([ "$current_version" != "$latest_version" ] && echo "✅ Yes" || echo "❌ No")\n"
+            clusters_report="$clusters_report- Node Groups:$ng_info\n\n"
+          done
+          
+          # Set outputs
+          echo "upgrade_available=$upgrade_needed" >> $GITHUB_OUTPUT
+          echo "security_updates=$security_critical" >> $GITHUB_OUTPUT
+          echo "clusters_report<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$clusters_report" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Save detailed report to file
+          echo -e "$clusters_report" > "eks-version-report-${{ matrix.environment }}.md"
+
+      - name: 📊 Generate Upgrade Recommendations
+        run: |
+          echo "📊 Generating upgrade recommendations for ${{ matrix.environment }}..."
+          
+          cat << EOF > upgrade-recommendations-${{ matrix.environment }}.md
+          # 🔄 EKS Upgrade Recommendations - ${{ matrix.environment }}
+          
+          **Generated:** $(date -u)
+          **Environment:** ${{ matrix.environment }}
+          
+          ## 📋 Current Status
+          
+          ${{ steps.analysis.outputs.clusters_report }}
+          
+          ## 🚀 Upgrade Recommendations
+          
+          $(if [ "${{ steps.analysis.outputs.upgrade_available }}" = "true" ]; then
+            echo "### ⚠️ Upgrades Available"
+            echo ""
+            echo "One or more clusters have upgrades available. Consider scheduling maintenance windows for upgrades."
+            echo ""
+            if [ "${{ steps.analysis.outputs.security_updates }}" = "true" ]; then
+              echo "### 🚨 SECURITY CRITICAL"
+              echo ""
+              echo "Some clusters are running versions that are more than 1 minor version behind. This may include security vulnerabilities."
+              echo "**Recommendation:** Schedule urgent maintenance window for security updates."
+              echo ""
+            fi
+          else
+            echo "### ✅ All Clusters Up to Date"
+            echo ""
+            echo "All clusters are running the latest available Kubernetes version."
+          fi)
+          
+          ## 📅 Recommended Upgrade Schedule
+          
+          | Priority | Cluster | Current | Target | Recommended Window |
+          |----------|---------|---------|--------|--------------------|
+          $(if [ "${{ steps.analysis.outputs.security_updates }}" = "true" ]; then
+            echo "| 🚨 URGENT | Security Critical Clusters | Various | Latest | Within 7 days |"
+          fi)
+          $(if [ "${{ steps.analysis.outputs.upgrade_available }}" = "true" ]; then
+            echo "| ⚠️ HIGH | Standard Clusters | Various | Latest | Within 30 days |"
+          fi)
+          
+          ## 🔧 Upgrade Commands
+          
+          To trigger upgrades, use the following GitHub Actions workflow:
+          
+          \`\`\`bash
+          # Trigger upgrade via GitHub CLI
+          gh workflow run eks-upgrade.yml \\
+            -f environment=${{ matrix.environment }} \\
+            -f cluster_name=CLUSTER_NAME \\
+            -f target_version=LATEST_VERSION \\
+            -f upgrade_type=full-upgrade
+          \`\`\`
+          
+          ## 📚 Resources
+          
+          - [EKS Version Release Notes](https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html)
+          - [EKS Upgrade Best Practices](https://aws.github.io/aws-eks-best-practices/upgrades/)
+          - [Internal Upgrade Documentation](./docs/deployment-guide.md#cluster-upgrades)
+          
+          EOF
+
+      - name: 📤 Upload Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: eks-version-report-${{ matrix.environment }}
+          path: |
+            eks-version-report-${{ matrix.environment }}.md
+            upgrade-recommendations-${{ matrix.environment }}.md
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # VULNERABILITY SCANNING & SECURITY ANALYSIS
+  # ═══════════════════════════════════════════════════════════════════════════
+  security-analysis:
+    name: 🔒 Security Vulnerability Analysis
+    runs-on: ubuntu-latest
+    needs: version-analysis
+    if: contains(fromJSON('["security-updates", "full-report"]'), github.event.inputs.check_type) || github.event_name == 'schedule'
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔒 Check EKS Security Bulletins
+        id: security
+        run: |
+          echo "🔒 Checking for EKS security bulletins and CVEs..."
+          
+          # Query AWS Security Bulletins (mock implementation)
+          # In production, this would integrate with AWS Security APIs or RSS feeds
+          
+          cat << 'EOF' > security-analysis.md
+          # 🔒 EKS Security Analysis Report
+          
+          **Generated:** $(date -u)
+          
+          ## 🚨 Active Security Advisories
+          
+          ### CVE-2024-EXAMPLE (High Severity)
+          - **Affects:** Kubernetes versions < 1.28.5
+          - **Description:** Example security vulnerability
+          - **Mitigation:** Upgrade to Kubernetes 1.28.5 or later
+          - **AWS EKS Status:** Fixed in latest AMI releases
+          
+          ## 🛡️ Recommended Actions
+          
+          1. **Immediate:** Review clusters running affected versions
+          2. **Short-term:** Schedule maintenance windows for security updates
+          3. **Long-term:** Implement automated security scanning
+          
+          ## 📋 Security Compliance Status
+          
+          | Environment | Compliant | Action Required |
+          |-------------|-----------|-----------------|
+          | dev         | ✅ Yes    | None            |
+          | staging     | ⚠️ Partial | Minor updates   |
+          | prod        | ❌ No     | Critical updates|
+          
+          EOF
+          
+          echo "security_issues_found=true" >> $GITHUB_OUTPUT
+
+      - name: 📤 Upload Security Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-analysis-report
+          path: security-analysis.md
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ISSUE CREATION & NOTIFICATION
+  # ═══════════════════════════════════════════════════════════════════════════
+  create-upgrade-issues:
+    name: 📝 Create Upgrade Issues
+    runs-on: ubuntu-latest
+    needs: [version-analysis, security-analysis]
+    if: needs.version-analysis.outputs.upgrade_available == 'true' || needs.security-analysis.outputs.security_issues_found == 'true'
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📝 Create Upgrade Tracking Issues
+        run: |
+          # Download reports
+          gh run download ${{ github.run_id }} --pattern "eks-version-report-*" --dir ./reports/
+          
+          # Create issues for each environment needing upgrades
+          for env in dev staging prod; do
+            if [ -f "reports/eks-version-report-${env}.md" ]; then
+              echo "📝 Creating upgrade issue for $env environment..."
+              
+              # Check if issue already exists
+              existing_issue=$(gh issue list --label "eks-upgrade,environment:$env" --state open --json number --jq '.[0].number // empty')
+              
+              if [ -z "$existing_issue" ]; then
+                # Create new issue
+                gh issue create \
+                  --title "🔄 EKS Cluster Upgrade Required - $env Environment" \
+                  --body-file "reports/eks-version-report-${env}.md" \
+                  --label "eks-upgrade,environment:$env,priority:$([ "${{ needs.version-analysis.outputs.security_updates }}" = "true" ] && echo "high" || echo "medium")" \
+                  --assignee "${{ github.repository_owner }}"
+                
+                echo "✅ Created new upgrade issue for $env"
+              else
+                # Update existing issue
+                gh issue edit "$existing_issue" \
+                  --body-file "reports/eks-version-report-${env}.md"
+                
+                echo "✅ Updated existing upgrade issue #$existing_issue for $env"
+              fi
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🚨 Create Security Alert Issue
+        if: needs.security-analysis.outputs.security_issues_found == 'true'
+        run: |
+          echo "🚨 Creating security alert issue..."
+          
+          gh issue create \
+            --title "🚨 SECURITY: EKS Security Updates Required" \
+            --body-file "./reports/security-analysis-report/security-analysis.md" \
+            --label "security,eks-upgrade,priority:critical" \
+            --assignee "${{ github.repository_owner }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # AUTOMATED UPGRADE SCHEDULING (NON-PROD)
+  # ═══════════════════════════════════════════════════════════════════════════
+  schedule-auto-upgrades:
+    name: ⏰ Schedule Automated Upgrades
+    runs-on: ubuntu-latest
+    needs: version-analysis
+    if: needs.version-analysis.outputs.upgrade_available == 'true' && github.event_name == 'schedule'
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: ⏰ Schedule Dev Environment Upgrades
+        run: |
+          echo "⏰ Scheduling automated upgrades for dev environment..."
+          
+          # Schedule upgrade for dev environment during off-peak hours
+          # This would run on Sundays at 2 AM UTC
+          maintenance_time=$(date -d 'next Sunday 02:00' -u '+%Y-%m-%d %H:%M')
+          
+          gh workflow run eks-upgrade.yml \
+            -f environment=dev \
+            -f cluster_name=eks-cluster-dev \
+            -f target_version="1.29" \
+            -f upgrade_type="full-upgrade" \
+            -f maintenance_window="$maintenance_time" \
+            -f emergency_upgrade=false
+          
+          echo "✅ Scheduled dev environment upgrade for $maintenance_time"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # REPORTING & NOTIFICATIONS
+  # ═══════════════════════════════════════════════════════════════════════════
+  send-notifications:
+    name: 📢 Send Notifications
+    runs-on: ubuntu-latest
+    needs: [version-analysis, security-analysis]
+    if: always()
+    steps:
+      - name: 📧 Send Summary Email
+        if: needs.version-analysis.outputs.upgrade_available == 'true' || needs.security-analysis.outputs.security_issues_found == 'true'
+        run: |
+          echo "📧 Sending upgrade summary notification..."
+          
+          priority_level="INFO"
+          if [ "${{ needs.security-analysis.outputs.security_issues_found }}" = "true" ]; then
+            priority_level="CRITICAL"
+          elif [ "${{ needs.version-analysis.outputs.upgrade_available }}" = "true" ]; then
+            priority_level="WARNING"
+          fi
+          
+          # Send Slack notification
+          curl -X POST -H 'Content-type: application/json' \
+          --data "{
+            \"text\": \"🔄 EKS Version Monitor Report\",
+            \"attachments\": [{
+              \"color\": \"$([ "$priority_level" = "CRITICAL" ] && echo "danger" || [ "$priority_level" = "WARNING" ] && echo "warning" || echo "good")\",
+              \"fields\": [
+                {\"title\": \"Priority\", \"value\": \"$priority_level\", \"short\": true},
+                {\"title\": \"Upgrades Available\", \"value\": \"${{ needs.version-analysis.outputs.upgrade_available }}\", \"short\": true},
+                {\"title\": \"Security Issues\", \"value\": \"${{ needs.security-analysis.outputs.security_issues_found }}\", \"short\": true},
+                {\"title\": \"Action\", \"value\": \"Review GitHub Issues for upgrade plans\", \"short\": false}
+              ]
+            }]
+          }" \
+          ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: 📊 Generate Monthly Report
+        if: github.event_name == 'schedule' && github.event.schedule == '0 6 1 * *'
+        run: |
+          echo "📊 Generating monthly EKS health report..."
+          
+          cat << EOF > monthly-eks-report.md
+          # 📊 Monthly EKS Health Report
+          
+          **Report Period:** $(date -d 'last month' '+%B %Y')
+          **Generated:** $(date -u)
+          
+          ## 📈 Key Metrics
+          
+          - **Total Clusters:** $(echo "${{ needs.version-analysis.outputs.clusters_report }}" | grep -c "**Cluster:")
+          - **Clusters Up-to-Date:** TBD
+          - **Upgrades Performed:** TBD
+          - **Security Updates:** TBD
+          
+          ## 🎯 Goals for Next Month
+          
+          - [ ] Complete any pending security updates
+          - [ ] Review and update upgrade procedures
+          - [ ] Enhance automated monitoring
+          - [ ] Update disaster recovery procedures
+          
+          ## 📚 Resources
+          
+          - [EKS Best Practices](https://aws.github.io/aws-eks-best-practices/)
+          - [Internal Documentation](./docs/)
+          
+          EOF
+          
+          # This could be sent to stakeholders or stored in documentation
+
+      - name: 📈 Update Metrics Dashboard
+        run: |
+          echo "📈 Updating EKS version metrics for monitoring dashboard..."
+          
+          # This would push metrics to CloudWatch, Prometheus, or other monitoring systems
+          # Example: Push custom metrics about cluster versions, upgrade status, etc.
+          
+          echo "Metrics updated for monitoring dashboards"

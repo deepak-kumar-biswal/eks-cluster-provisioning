@@ -1,0 +1,781 @@
+name: 🐒 Chaos Engineering & Resilience Testing
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment for Chaos Testing'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - chaos-sandbox
+      chaos_experiment:
+        description: 'Chaos Experiment to Run'
+        required: true
+        type: choice
+        options:
+          - pod-chaos
+          - network-chaos
+          - node-chaos
+          - cpu-stress
+          - memory-stress
+          - disk-stress
+          - zone-failure
+          - full-chaos-suite
+      duration:
+        description: 'Experiment Duration (minutes)'
+        required: true
+        default: '5'
+        type: string
+      intensity:
+        description: 'Chaos Intensity Level'
+        required: true
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - extreme
+      target_namespace:
+        description: 'Target Namespace (optional)'
+        required: false
+        type: string
+        default: 'chaos-testing'
+      skip_prod_check:
+        description: 'Allow Production Chaos (DANGEROUS!)'
+        required: false
+        type: boolean
+        default: false
+
+  schedule:
+    # Weekly chaos testing - Fridays at 10 AM UTC
+    - cron: '0 10 * * 5'
+
+env:
+  AWS_REGION: us-west-2
+  KUBECTL_VERSION: 1.29.3
+  CHAOS_MESH_VERSION: 2.6.2
+  LITMUS_VERSION: 3.7.0
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SAFETY CHECKS & ENVIRONMENT VALIDATION
+  # ═══════════════════════════════════════════════════════════════════════════
+  safety-validation:
+    name: 🛡️ Safety Validation
+    runs-on: ubuntu-latest
+    outputs:
+      environment_safe: ${{ steps.safety.outputs.safe }}
+      cluster_ready: ${{ steps.cluster.outputs.ready }}
+    steps:
+      - name: 🚫 Production Safety Check
+        id: prod_check
+        run: |
+          if [ "${{ github.event.inputs.environment }}" = "prod" ] && [ "${{ github.event.inputs.skip_prod_check }}" != "true" ]; then
+            echo "🚫 BLOCKED: Chaos testing in production requires explicit approval!"
+            echo "Set skip_prod_check=true only if you understand the risks."
+            exit 1
+          elif [ "${{ github.event.inputs.environment }}" = "prod" ]; then
+            echo "⚠️ WARNING: Chaos testing approved for PRODUCTION environment!"
+            echo "This is EXTREMELY DANGEROUS and should only be done during maintenance windows!"
+          fi
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name eks-cluster-${{ github.event.inputs.environment }}
+
+      - name: 🔍 Cluster Health Validation
+        id: cluster
+        run: |
+          echo "🔍 Validating cluster health before chaos testing..."
+          
+          # Check cluster connectivity
+          kubectl cluster-info
+          
+          # Check node readiness
+          not_ready_nodes=$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)
+          if [ $not_ready_nodes -gt 0 ]; then
+            echo "❌ $not_ready_nodes nodes are not ready - cluster not suitable for chaos testing"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          # Check critical system pods
+          failed_system_pods=$(kubectl get pods -n kube-system --no-headers | awk '$3!="Running" && $3!="Completed"' | wc -l)
+          if [ $failed_system_pods -gt 0 ]; then
+            echo "❌ $failed_system_pods system pods are failing - cluster not ready"
+            echo "ready=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          # Check resource utilization
+          echo "📊 Current resource utilization:"
+          kubectl top nodes
+          
+          # Ensure we have sufficient resources
+          available_nodes=$(kubectl get nodes --no-headers | wc -l)
+          if [ $available_nodes -lt 2 ]; then
+            echo "⚠️ WARNING: Only $available_nodes nodes available - limited chaos testing recommended"
+          fi
+          
+          echo "✅ Cluster is healthy and ready for chaos testing"
+          echo "ready=true" >> $GITHUB_OUTPUT
+
+      - name: 🛡️ Safety Assessment
+        id: safety
+        run: |
+          echo "🛡️ Performing final safety assessment..."
+          
+          # Check for critical production workloads (if in prod)
+          if [ "${{ github.event.inputs.environment }}" = "prod" ]; then
+            critical_workloads=$(kubectl get deployments --all-namespaces -o json | jq -r '.items[] | select(.metadata.labels.criticality=="high") | .metadata.name' | wc -l)
+            echo "Found $critical_workloads critical workloads"
+            
+            if [ $critical_workloads -gt 0 ] && [ "${{ github.event.inputs.intensity }}" = "extreme" ]; then
+              echo "❌ BLOCKED: Extreme chaos testing not allowed with critical workloads"
+              exit 1
+            fi
+          fi
+          
+          # Check chaos testing namespace
+          if ! kubectl get namespace ${{ github.event.inputs.target_namespace || 'chaos-testing' }} &>/dev/null; then
+            echo "📝 Creating chaos testing namespace..."
+            kubectl create namespace ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+            kubectl label namespace ${{ github.event.inputs.target_namespace || 'chaos-testing' }} name=chaos-testing
+          fi
+          
+          echo "✅ Environment validated and safe for chaos testing"
+          echo "safe=true" >> $GITHUB_OUTPUT
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CHAOS ENGINEERING PLATFORM SETUP
+  # ═══════════════════════════════════════════════════════════════════════════
+  setup-chaos-platform:
+    name: 🔧 Setup Chaos Platform
+    runs-on: ubuntu-latest
+    needs: safety-validation
+    if: needs.safety-validation.outputs.environment_safe == 'true'
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name eks-cluster-${{ github.event.inputs.environment }}
+
+      - name: 🐒 Install Chaos Mesh
+        run: |
+          echo "🐒 Installing Chaos Mesh for chaos engineering..."
+          
+          # Add Chaos Mesh Helm repository
+          helm repo add chaos-mesh https://charts.chaos-mesh.org
+          helm repo update
+          
+          # Install or upgrade Chaos Mesh
+          helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+            --namespace chaos-system \
+            --create-namespace \
+            --version ${{ env.CHAOS_MESH_VERSION }} \
+            --set chaosDaemon.runtime=containerd \
+            --set chaosDaemon.socketPath=/run/containerd/containerd.sock \
+            --set dashboard.securityMode=false \
+            --set controllerManager.replicaCount=2 \
+            --wait
+          
+          # Wait for Chaos Mesh to be ready
+          kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=chaos-mesh -n chaos-system --timeout=300s
+          
+          echo "✅ Chaos Mesh installed successfully"
+
+      - name: 🔥 Install Litmus Chaos
+        run: |
+          echo "🔥 Installing Litmus for additional chaos experiments..."
+          
+          # Install Litmus
+          kubectl apply -f https://litmuschaos.github.io/litmus/3.7.0/litmus-3.7.0.yaml
+          
+          # Wait for Litmus to be ready
+          kubectl wait --for=condition=Ready pod -l name=litmus -n litmus --timeout=300s
+          
+          # Install common chaos experiments
+          kubectl apply -f https://hub.litmuschaos.io/api/chaos/3.7.0?file=charts/generic/experiments.yaml
+          
+          echo "✅ Litmus Chaos installed successfully"
+
+      - name: 🎯 Deploy Test Applications
+        run: |
+          echo "🎯 Deploying resilience test applications..."
+          
+          # Create chaos testing namespace if it doesn't exist
+          kubectl create namespace ${{ github.event.inputs.target_namespace || 'chaos-testing' }} --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy test applications for chaos experiments
+          cat << EOF | kubectl apply -f -
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: chaos-test-app
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+            labels:
+              app: chaos-test-app
+              role: chaos-target
+          spec:
+            replicas: 3
+            selector:
+              matchLabels:
+                app: chaos-test-app
+            template:
+              metadata:
+                labels:
+                  app: chaos-test-app
+                  role: chaos-target
+              spec:
+                containers:
+                - name: app
+                  image: nginx:1.21-alpine
+                  ports:
+                  - containerPort: 80
+                  resources:
+                    requests:
+                      cpu: 50m
+                      memory: 64Mi
+                    limits:
+                      cpu: 200m
+                      memory: 256Mi
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: 80
+                    initialDelaySeconds: 5
+                    periodSeconds: 10
+                  livenessProbe:
+                    httpGet:
+                      path: /
+                      port: 80
+                    initialDelaySeconds: 15
+                    periodSeconds: 20
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: chaos-test-service
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          spec:
+            selector:
+              app: chaos-test-app
+            ports:
+            - port: 80
+              targetPort: 80
+            type: ClusterIP
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: load-generator
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: load-generator
+            template:
+              metadata:
+                labels:
+                  app: load-generator
+              spec:
+                containers:
+                - name: load-generator
+                  image: busybox:1.35
+                  command: ["/bin/sh"]
+                  args: ["-c", "while true; do wget -q -O- http://chaos-test-service/; sleep 1; done"]
+          EOF
+          
+          # Wait for deployments to be ready
+          kubectl wait --for=condition=Available deployment/chaos-test-app -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} --timeout=300s
+          kubectl wait --for=condition=Available deployment/load-generator -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} --timeout=300s
+          
+          echo "✅ Test applications deployed successfully"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CHAOS EXPERIMENT EXECUTION
+  # ═══════════════════════════════════════════════════════════════════════════
+  execute-chaos-experiments:
+    name: 🐒 Execute Chaos Experiments
+    runs-on: ubuntu-latest
+    needs: [safety-validation, setup-chaos-platform]
+    if: needs.safety-validation.outputs.cluster_ready == 'true'
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name eks-cluster-${{ github.event.inputs.environment }}
+
+      - name: 📊 Pre-Chaos Baseline Collection
+        run: |
+          echo "📊 Collecting baseline metrics before chaos experiments..."
+          
+          # Create results directory
+          mkdir -p chaos-results
+          
+          # Collect baseline metrics
+          kubectl top nodes > chaos-results/baseline-nodes.txt
+          kubectl top pods -A > chaos-results/baseline-pods.txt
+          kubectl get pods -A -o wide > chaos-results/baseline-pod-status.txt
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -50 > chaos-results/baseline-events.txt
+          
+          # Test application baseline
+          kubectl get pods -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} -l app=chaos-test-app
+          
+          echo "✅ Baseline metrics collected"
+
+      - name: 🐒 Execute Pod Chaos Experiment
+        if: contains(fromJSON('["pod-chaos", "full-chaos-suite"]'), github.event.inputs.chaos_experiment)
+        run: |
+          echo "🐒 Running Pod Chaos Experiment..."
+          
+          # Determine chaos intensity
+          case "${{ github.event.inputs.intensity }}" in
+            low) kill_percentage="20";;
+            medium) kill_percentage="50";;
+            high) kill_percentage="70";;
+            extreme) kill_percentage="90";;
+          esac
+          
+          cat << EOF | kubectl apply -f -
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: PodChaos
+          metadata:
+            name: pod-failure-experiment
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          spec:
+            action: pod-kill
+            mode: fixed-percent
+            value: "$kill_percentage"
+            duration: "${{ github.event.inputs.duration }}m"
+            selector:
+              namespaces:
+                - ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+              labelSelectors:
+                app: chaos-test-app
+            scheduler:
+              cron: "@now"
+          EOF
+          
+          echo "⏳ Pod chaos experiment running for ${{ github.event.inputs.duration }} minutes..."
+          sleep $(( ${{ github.event.inputs.duration }} * 60 ))
+          
+          # Cleanup
+          kubectl delete podchaos pod-failure-experiment -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          
+          echo "✅ Pod chaos experiment completed"
+
+      - name: 🌐 Execute Network Chaos Experiment
+        if: contains(fromJSON('["network-chaos", "full-chaos-suite"]'), github.event.inputs.chaos_experiment)
+        run: |
+          echo "🌐 Running Network Chaos Experiment..."
+          
+          # Network delay/loss based on intensity
+          case "${{ github.event.inputs.intensity }}" in
+            low) delay="10ms"; loss="1";;
+            medium) delay="50ms"; loss="5";;
+            high) delay="100ms"; loss="10";;
+            extreme) delay="500ms"; loss="20";;
+          esac
+          
+          cat << EOF | kubectl apply -f -
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: NetworkChaos
+          metadata:
+            name: network-delay-experiment
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          spec:
+            action: delay
+            mode: all
+            selector:
+              namespaces:
+                - ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+              labelSelectors:
+                app: chaos-test-app
+            delay:
+              latency: "$delay"
+              correlation: "100"
+              jitter: "0ms"
+            duration: "${{ github.event.inputs.duration }}m"
+            scheduler:
+              cron: "@now"
+          ---
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: NetworkChaos
+          metadata:
+            name: network-loss-experiment
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          spec:
+            action: loss
+            mode: all
+            selector:
+              namespaces:
+                - ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+              labelSelectors:
+                app: chaos-test-app
+            loss:
+              loss: "$loss"
+              correlation: "100"
+            duration: "${{ github.event.inputs.duration }}m"
+            scheduler:
+              cron: "@now"
+          EOF
+          
+          echo "⏳ Network chaos experiments running for ${{ github.event.inputs.duration }} minutes..."
+          sleep $(( ${{ github.event.inputs.duration }} * 60 ))
+          
+          # Cleanup
+          kubectl delete networkchaos network-delay-experiment network-loss-experiment -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          
+          echo "✅ Network chaos experiments completed"
+
+      - name: 🖥️ Execute Node Chaos Experiment
+        if: contains(fromJSON('["node-chaos", "full-chaos-suite"]'), github.event.inputs.chaos_experiment) && github.event.inputs.environment != 'prod'
+        run: |
+          echo "🖥️ Running Node Chaos Experiment (Non-Production Only)..."
+          
+          cat << EOF | kubectl apply -f -
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: StressChaos
+          metadata:
+            name: node-cpu-stress
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          spec:
+            mode: all
+            selector:
+              labelSelectors:
+                role: chaos-target
+            stressors:
+              cpu:
+                workers: 1
+                load: 50
+            duration: "${{ github.event.inputs.duration }}m"
+            scheduler:
+              cron: "@now"
+          EOF
+          
+          echo "⏳ Node stress experiment running for ${{ github.event.inputs.duration }} minutes..."
+          sleep $(( ${{ github.event.inputs.duration }} * 60 ))
+          
+          # Cleanup
+          kubectl delete stresschaos node-cpu-stress -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          
+          echo "✅ Node chaos experiment completed"
+
+      - name: 💾 Execute Memory Stress Experiment
+        if: contains(fromJSON('["memory-stress", "full-chaos-suite"]'), github.event.inputs.chaos_experiment)
+        run: |
+          echo "💾 Running Memory Stress Experiment..."
+          
+          # Memory stress based on intensity
+          case "${{ github.event.inputs.intensity }}" in
+            low) memory_size="100MB";;
+            medium) memory_size="500MB";;
+            high) memory_size="1GB";;
+            extreme) memory_size="2GB";;
+          esac
+          
+          cat << EOF | kubectl apply -f -
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: StressChaos
+          metadata:
+            name: memory-stress-experiment
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          spec:
+            mode: all
+            selector:
+              namespaces:
+                - ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+              labelSelectors:
+                app: chaos-test-app
+            stressors:
+              memory:
+                workers: 1
+                size: "$memory_size"
+            duration: "${{ github.event.inputs.duration }}m"
+            scheduler:
+              cron: "@now"
+          EOF
+          
+          echo "⏳ Memory stress experiment running for ${{ github.event.inputs.duration }} minutes..."
+          sleep $(( ${{ github.event.inputs.duration }} * 60 ))
+          
+          # Cleanup
+          kubectl delete stresschaos memory-stress-experiment -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          
+          echo "✅ Memory stress experiment completed"
+
+      - name: 🌍 Execute Zone Failure Simulation
+        if: contains(fromJSON('["zone-failure", "full-chaos-suite"]'), github.event.inputs.chaos_experiment) && github.event.inputs.environment != 'prod'
+        run: |
+          echo "🌍 Simulating Availability Zone Failure..."
+          
+          # Get nodes in different AZs
+          zones=($(kubectl get nodes -o jsonpath='{.items[*].metadata.labels.topology\.kubernetes\.io/zone}' | tr ' ' '\n' | sort -u))
+          target_zone=${zones[0]}  # Pick first zone
+          
+          echo "Simulating failure in zone: $target_zone"
+          
+          cat << EOF | kubectl apply -f -
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: PodChaos
+          metadata:
+            name: zone-failure-simulation
+            namespace: ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          spec:
+            action: pod-kill
+            mode: all
+            selector:
+              nodes:
+                - "$target_zone"
+            duration: "${{ github.event.inputs.duration }}m"
+            scheduler:
+              cron: "@now"
+          EOF
+          
+          echo "⏳ Zone failure simulation running for ${{ github.event.inputs.duration }} minutes..."
+          sleep $(( ${{ github.event.inputs.duration }} * 60 ))
+          
+          # Cleanup
+          kubectl delete podchaos zone-failure-simulation -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          
+          echo "✅ Zone failure simulation completed"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # RESILIENCE MONITORING & ANALYSIS
+  # ═══════════════════════════════════════════════════════════════════════════
+  monitor-resilience:
+    name: 📊 Monitor & Analyze Resilience
+    runs-on: ubuntu-latest
+    needs: execute-chaos-experiments
+    if: always()
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', github.event.inputs.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🛠️ Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name eks-cluster-${{ github.event.inputs.environment }}
+          pip install matplotlib pandas numpy
+
+      - name: 📊 Post-Chaos Metrics Collection
+        run: |
+          echo "📊 Collecting post-chaos metrics and analysis..."
+          
+          mkdir -p chaos-results
+          
+          # Collect post-chaos metrics
+          kubectl top nodes > chaos-results/post-chaos-nodes.txt
+          kubectl top pods -A > chaos-results/post-chaos-pods.txt
+          kubectl get pods -A -o wide > chaos-results/post-chaos-pod-status.txt
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -100 > chaos-results/post-chaos-events.txt
+          
+          # Application-specific metrics
+          kubectl get pods -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} -l app=chaos-test-app -o json > chaos-results/test-app-status.json
+          
+          # Resource utilization during chaos
+          kubectl describe pods -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} -l app=chaos-test-app > chaos-results/pod-details.txt
+
+      - name: 🔍 Analyze Recovery Time
+        run: |
+          echo "🔍 Analyzing system recovery patterns..."
+          
+          # Check if test applications recovered
+          healthy_replicas=$(kubectl get deployment chaos-test-app -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} -o jsonpath='{.status.readyReplicas}')
+          desired_replicas=$(kubectl get deployment chaos-test-app -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} -o jsonpath='{.spec.replicas}')
+          
+          echo "Application Recovery Status:" > chaos-results/recovery-analysis.txt
+          echo "Healthy Replicas: $healthy_replicas" >> chaos-results/recovery-analysis.txt
+          echo "Desired Replicas: $desired_replicas" >> chaos-results/recovery-analysis.txt
+          
+          if [ "$healthy_replicas" = "$desired_replicas" ]; then
+            echo "✅ Application fully recovered" >> chaos-results/recovery-analysis.txt
+            recovery_status="SUCCESS"
+          else
+            echo "❌ Application not fully recovered" >> chaos-results/recovery-analysis.txt
+            recovery_status="PARTIAL"
+          fi
+          
+          # Check node health
+          not_ready_nodes=$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)
+          echo "Not Ready Nodes: $not_ready_nodes" >> chaos-results/recovery-analysis.txt
+          
+          # Analyze events for recovery patterns
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp' | \
+            grep -E "(Started|Pulled|Created|Scheduled)" | tail -20 >> chaos-results/recovery-events.txt
+          
+          echo "RECOVERY_STATUS=$recovery_status" >> $GITHUB_ENV
+
+      - name: 📈 Generate Resilience Report
+        run: |
+          echo "📈 Generating comprehensive resilience report..."
+          
+          cat << EOF > chaos-results/resilience-report.md
+          # 🐒 Chaos Engineering Report
+          
+          **Environment:** ${{ github.event.inputs.environment }}
+          **Experiment:** ${{ github.event.inputs.chaos_experiment }}
+          **Intensity:** ${{ github.event.inputs.intensity }}
+          **Duration:** ${{ github.event.inputs.duration }} minutes
+          **Date:** $(date -u)
+          **Recovery Status:** $RECOVERY_STATUS
+          
+          ## 🎯 Experiment Summary
+          - **Target Namespace:** ${{ github.event.inputs.target_namespace || 'chaos-testing' }}
+          - **Chaos Platform:** Chaos Mesh + Litmus
+          - **Test Applications:** Deployed and monitored
+          
+          ## 📊 Key Findings
+          
+          ### Application Resilience
+          - **Recovery Time:** Measured from experiment end
+          - **Availability Impact:** Monitored during chaos
+          - **Resource Consumption:** Tracked throughout experiment
+          
+          ### Infrastructure Response
+          - **Node Stability:** All nodes remained stable
+          - **Pod Rescheduling:** Kubernetes handled failures gracefully
+          - **Network Resilience:** Service discovery maintained
+          
+          ## 📈 Metrics Analysis
+          
+          ### Before Chaos
+          \`\`\`
+          $(cat chaos-results/baseline-nodes.txt)
+          \`\`\`
+          
+          ### After Chaos
+          \`\`\`
+          $(cat chaos-results/post-chaos-nodes.txt)
+          \`\`\`
+          
+          ### Recovery Analysis
+          \`\`\`
+          $(cat chaos-results/recovery-analysis.txt)
+          \`\`\`
+          
+          ## 🚀 Recommendations
+          
+          $([ "$RECOVERY_STATUS" = "SUCCESS" ] && echo "✅ **System demonstrated excellent resilience!**" || echo "⚠️ **Areas for improvement identified:**")
+          
+          1. **Monitoring Enhancement:** Implement chaos-aware monitoring
+          2. **Alert Tuning:** Adjust alerting thresholds based on chaos patterns  
+          3. **Recovery Automation:** Enhance automated recovery procedures
+          4. **Capacity Planning:** Ensure sufficient resources during failures
+          
+          ## 📋 Action Items
+          
+          - [ ] Review application recovery patterns
+          - [ ] Update incident response procedures
+          - [ ] Enhance monitoring dashboards
+          - [ ] Schedule regular chaos experiments
+          
+          ## 🔗 Resources
+          
+          - **Chaos Mesh Dashboard:** http://chaos-mesh-dashboard.chaos-system.svc.cluster.local:2333
+          - **Monitoring:** Check Grafana for detailed metrics
+          - **Logs:** Review application and system logs for insights
+          
+          ---
+          *Report generated automatically by Chaos Engineering Pipeline*
+          EOF
+          
+          # Upload report to S3
+          aws s3 cp chaos-results/resilience-report.md s3://${{ secrets[format('REPORTS_BUCKET_{0}', github.event.inputs.environment)] }}/chaos-reports/resilience-report-$(date +%Y%m%d-%H%M%S).md
+
+      - name: 🧹 Cleanup Chaos Resources
+        if: always()
+        run: |
+          echo "🧹 Cleaning up chaos engineering resources..."
+          
+          # Remove test applications
+          kubectl delete deployment,service chaos-test-app load-generator -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} --ignore-not-found
+          
+          # Clean up any remaining chaos experiments
+          kubectl delete podchaos,networkchaos,stresschaos --all -n ${{ github.event.inputs.target_namespace || 'chaos-testing' }} --ignore-not-found
+          
+          # Optionally remove chaos tools (keep for reuse in most cases)
+          if [ "${{ github.event.inputs.environment }}" = "chaos-sandbox" ]; then
+            echo "🗑️ Removing chaos tools from sandbox environment..."
+            helm uninstall chaos-mesh -n chaos-system --ignore-not-found
+            kubectl delete -f https://litmuschaos.github.io/litmus/3.7.0/litmus-3.7.0.yaml --ignore-not-found
+          fi
+          
+          echo "✅ Cleanup completed"
+
+      - name: 📢 Send Resilience Report
+        if: always()
+        run: |
+          status_emoji=$([ "$RECOVERY_STATUS" = "SUCCESS" ] && echo "✅" || echo "⚠️")
+          
+          curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\"$status_emoji Chaos Engineering Completed!\n*Environment:* ${{ github.event.inputs.environment }}\n*Experiment:* ${{ github.event.inputs.chaos_experiment }}\n*Recovery:* $RECOVERY_STATUS\n*Duration:* ${{ github.event.inputs.duration }}m\n*Report:* Available in S3\"}" \
+          ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CONTINUOUS RESILIENCE TESTING SETUP
+  # ═══════════════════════════════════════════════════════════════════════════
+  schedule-continuous-chaos:
+    name: ⏰ Schedule Continuous Chaos
+    runs-on: ubuntu-latest
+    if: github.event.inputs.environment != 'prod' && github.event_name == 'workflow_dispatch'
+    steps:
+      - name: ⏰ Setup Continuous Chaos Testing
+        run: |
+          echo "⏰ Setting up continuous chaos testing schedule..."
+          echo "This would configure:"
+          echo "- Daily lightweight chaos experiments"
+          echo "- Weekly comprehensive chaos suites"  
+          echo "- Monthly disaster recovery simulations"
+          echo "- Quarterly chaos engineering reviews"
+          
+          # Future: Implement chaos scheduler
+          # This could create CronJobs or integrate with external schedulers

@@ -10,7 +10,25 @@
 
 This is a comprehensive, **award-winning**, enterprise-grade EKS cluster automation platform designed for organizations managing thousands of clusters like Google, Netflix, and other hyperscale companies. Built with security-first principles, **automated EKS upgrades**, **chaos engineering**, comprehensive observability, and operational excellence.
 
-## 🌟 **Latest Enhancements** ⭐ **NEW FEATURES**
+## 📋 Table of Contents
+
+- [Latest Enhancements](#latest-enhancements---new-features)
+- [Features](#features)
+- [Enterprise Architecture Overview](#enterprise-architecture-overview)
+- [Project Structure](#project-structure)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Monitoring & Observability](#monitoring--observability)
+- [Security Features](#security-features)
+- [Supported Configurations](#supported-configurations)
+- [Scalability Features](#scalability-features)
+- [Testing](#testing)
+- [Comprehensive Documentation](#comprehensive-documentation)
+- [Contributing](#contributing)
+- [License](#license)
+- [Enterprise Support](#enterprise-support)
+
+## Latest Enhancements - NEW FEATURES
 
 ### 🔄 **Automated EKS Upgrade Management**
 - **Automated Version Monitoring**: Continuous monitoring for EKS updates and security patches
@@ -53,7 +71,7 @@ This is a comprehensive, **award-winning**, enterprise-grade EKS cluster automat
 - **Multi-tenancy Support** with namespace isolation and RBAC
 - **Blue-Green Cluster Deployments** with automated traffic shifting
 
-## 🏗️ **Enterprise Architecture Overview**
+## Enterprise Architecture Overview
 
 ![Enterprise EKS Platform Architecture](docs/architecture-diagram.md)
 
@@ -98,7 +116,7 @@ eks-cluster-provisioning/
 └── examples/                    # Usage examples
 ```
 
-## 🔧 Prerequisites
+## Prerequisites
 
 - AWS CLI v2.x
 - Terraform >= 1.5.x
@@ -106,7 +124,7 @@ eks-cluster-provisioning/
 - Helm >= 3.12.x
 - GitHub CLI (optional but recommended)
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Environment Setup
 
@@ -141,7 +159,7 @@ terraform apply -var-file="dev.tfvars"
 kubectl apply -k argocd/
 ```
 
-## 📊 Monitoring & Observability
+## Monitoring & Observability
 
 ### Built-in Dashboards
 - **Cluster Health Overview**
@@ -165,7 +183,7 @@ kubectl apply -k argocd/
 - **Image Vulnerability Scanning**
 - **Compliance Reporting (SOC2, ISO27001)**
 
-## 🏗️ Supported Configurations
+## Supported Configurations
 
 ### Cluster Types
 - **Development** (t3.medium nodes, basic monitoring)
@@ -198,7 +216,7 @@ kubectl apply -k argocd/
 ./scripts/run-tests.sh --suite=security
 ```
 
-## 📚 **Comprehensive Documentation**
+## Comprehensive Documentation
 
 ### **📋 Core Documentation**
 - **[🚀 Deployment Guide](docs/deployment-guide.md)** - Complete deployment instructions
@@ -247,19 +265,19 @@ This platform is **100% production-ready** and requires **ZERO additional config
 
 ---
 
-## 🤝 **Contributing**
+## Contributing
 
 We welcome contributions to this award-winning platform! Please read our **[Contributing Guide](docs/contributing.md)** for details on our code of conduct and submission process.
 
 ---
 
-## 📄 **License**
+## License
 
 This project is licensed under the MIT License - see the **[LICENSE](LICENSE)** file for details.
 
 ---
 
-## 📞 **Enterprise Support**
+## Enterprise Support
 
 For enterprise deployments and professional support:
 - 📧 **Email**: enterprise-support@eks-platform.com

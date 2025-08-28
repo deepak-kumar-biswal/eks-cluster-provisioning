@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="https://img.shields.io/badge/🚀-EKS%20Cluster%20Platform-blue?style=for-the-badge&logoColor=white" alt="EKS Platform"/>
-  <img src="https://img.shields.io/badge/⚡-Enterprise%20Grade-orange?style=for-the-badge" alt="Enterprise"/>
-  <img src="https://img.shields.io/badge/🏆-Award%20Winning-gold?style=for-the-badge" alt="Award Winning"/>
+  <img src="https://img.shields.io/badge/%F0%9F%9A%80-EKS%20Cluster%20Platform-blue?style=for-the-badge&logoColor=white" alt="EKS Platform"/>
+  <img src="https://img.shields.io/badge/%E2%9A%A1-Enterprise%20Grade-orange?style=for-the-badge" alt="Enterprise"/>
+  <img src="https://img.shields.io/badge/%F0%9F%8F%86-Award%20Winning-gold?style=for-the-badge" alt="Award Winning"/>
 </div>
 
 <div align="center">
@@ -11,11 +11,12 @@
 
 <div align="center">
 
-[![EKS CI/CD](https://github.com/your-org/eks-cluster-provisioning/workflows/EKS%20CI/CD/badge.svg)](https://github.com/your-org/eks-cluster-provisioning/actions)
-[![Security Scan](https://github.com/your-org/eks-cluster-provisioning/workflows/Security%20Scan/badge.svg)](https://github.com/your-org/eks-cluster-provisioning/actions)
-[![Chaos Engineering](https://github.com/your-org/eks-cluster-provisioning/workflows/Chaos%20Engineering/badge.svg)](https://github.com/your-org/eks-cluster-provisioning/actions)
-[![EKS Upgrades](https://github.com/your-org/eks-cluster-provisioning/workflows/EKS%20Upgrades/badge.svg)](https://github.com/your-org/eks-cluster-provisioning/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Terraform](https://img.shields.io/badge/Terraform-1.5%2B-623CE4?style=for-the-badge&logo=terraform&logoColor=white)](https://www.terraform.io/)
+[![AWS EKS](https://img.shields.io/badge/AWS-EKS-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white)](https://aws.amazon.com/eks/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.29%2B-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![ArgoCD](https://img.shields.io/badge/ArgoCD-GitOps-EF7B4D?style=for-the-badge&logo=argo&logoColor=white)](https://argo-cd.readthedocs.io/)
+[![Chaos Engineering](https://img.shields.io/badge/Chaos-Engineering-FF6B6B?style=for-the-badge&logo=chaos&logoColor=white)](https://chaoseng.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
 </div>
 
@@ -26,16 +27,16 @@ This is a comprehensive, **award-winning**, enterprise-grade EKS cluster automat
 ## 📋 Table of Contents
 
 - [Latest Enhancements](#latest-enhancements---new-features)
-- [Features](#features)
+- [🚀 Features](#-features)
 - [Enterprise Architecture Overview](#enterprise-architecture-overview)
-- [Project Structure](#project-structure)
+- [📁 Project Structure](#-project-structure)
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Monitoring & Observability](#monitoring--observability)
-- [Security Features](#security-features)
+- [🔒 Security Features](#-security-features)
 - [Supported Configurations](#supported-configurations)
-- [Scalability Features](#scalability-features)
-- [Testing](#testing)
+- [📈 Scalability Features](#-scalability-features)
+- [🧪 Testing](#-testing)
 - [Comprehensive Documentation](#comprehensive-documentation)
 - [Contributing](#contributing)
 - [License](#license)
@@ -63,7 +64,7 @@ This is a comprehensive, **award-winning**, enterprise-grade EKS cluster automat
 - **Recovery Time Metrics**: MTTR tracking and system resilience scoring
 - **Security Alert Integration**: Real-time security vulnerability monitoring
 
-## �🚀 Features
+## 🚀 Features
 
 ### Core Capabilities
 - **Multi-Account & Multi-Region EKS Cluster Management**
@@ -143,8 +144,8 @@ eks-cluster-provisioning/
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd eks-cluster-provisioning
+git clone https://github.com/deepak-kumar-biswal/aws-platform-audit.git
+cd aws-platform-audit/eks-cluster-creation-updation/eks-cluster-provisioning
 
 # Install dependencies
 ./scripts/setup-environment.sh
@@ -234,7 +235,7 @@ kubectl apply -k argocd/
 ### **📋 Core Documentation**
 - **[🚀 Deployment Guide](docs/deployment-guide.md)** - Complete deployment instructions
 - **[🛡️ Security Best Practices](docs/security-best-practices.md)** - Enterprise security guidelines
-- **[🔧 Troubleshooting Guide](docs/troubleshooting.md)** - Issue resolution procedures
+- **[🔧 Troubleshooting Guide](docs/troubleshooting-guide.md)** - Issue resolution procedures
 - **[📊 Architecture Diagram](docs/architecture-diagram.md)** - Detailed system architecture ⭐ **NEW**
 - **[✅ Verification Report](docs/comprehensive-verification-report.md)** - Complete audit results ⭐ **NEW**
 

@@ -1,0 +1,8 @@
+# Production dependencies for EKS Cluster Provisioning Platform
+boto3>=1.28.0
+botocore>=1.31.0
+kubernetes>=27.2.0
+pyyaml>=6.0
+jinja2>=3.1.0
+requests>=2.31.0
+click>=8.1.0
